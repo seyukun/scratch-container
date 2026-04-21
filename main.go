@@ -109,49 +109,77 @@ func run() int {
 	containerIpRange := os.Args[N_IPRANGE]
 	containerDefaultRouteIP := os.Args[N_ROUTEIP]
 	hostMasterBridgeNic := os.Args[N_MASTERBRNIC]
-	containerTempNic := rand.Text()[:8]
+	hostNic := "veth-" + rand.Text()[:10]
+	containerTempNic := rand.Text()[:15]
 
-	// Setup network namespace and veth pair
+	if _, err := os.Stat(filepath.Join("/var/run/netns", id)); err == nil {
+		fmt.Fprintf(os.Stderr, "network namespace %q already exists\n", id)
+		return 1
+	} else if !os.IsNotExist(err) {
+		must(err)
+		return 1
+	}
+
+	hostUID, hostGID, err := hostUserIDs()
+	must(err)
+	readyR, readyW, err := os.Pipe()
+	must(err)
+	defer readyR.Close()
+	defer readyW.Close()
+
+	cmd := exec.Command("/proc/self/exe", append([]string{"child"}, os.Args[2:]...)...)
+
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	cmd.ExtraFiles = []*os.File{readyR} // readyR = fd 3
+
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Cloneflags: syscall.CLONE_NEWPID |
+			syscall.CLONE_NEWUTS |
+			syscall.CLONE_NEWNS |
+			syscall.CLONE_NEWIPC |
+			syscall.CLONE_NEWUSER |
+			syscall.CLONE_NEWNET,
+		UidMappings: []syscall.SysProcIDMap{
+			{ContainerID: 0, HostID: hostUID, Size: 1},
+		},
+		GidMappings: []syscall.SysProcIDMap{
+			{ContainerID: 0, HostID: hostGID, Size: 1},
+		},
+		GidMappingsEnableSetgroups: true,
+		Credential:                 &syscall.Credential{Uid: 0, Gid: 0, Groups: []uint32{0}},
+	}
+
+	must(cmd.Start())
+	readyR.Close()
+
+	must(command("ip", "netns", "attach", id, strconv.Itoa(cmd.Process.Pid)).Run())
 	defer command("ip", "netns", "del", id).Run()
-	if err := command("ip", "netns", "add", id).Run(); err != nil {
+
+	if err := command("ip", "link", "add", hostNic, "type", "veth", "peer", "name", containerTempNic).Run(); err != nil {
+		readyW.Close()
 		must(err)
 		return 1
 	}
-	defer command("ip", "link", "del", id).Run()
-	if err := command("ip", "link", "add", id, "type", "veth", "peer", "name", containerTempNic).Run(); err != nil {
-		must(err)
-		return 1
-	}
+	defer command("ip", "link", "del", hostNic).Run()
+
 	ipCommands := [][]string{
 		{"link", "set", containerTempNic, "netns", id},
-		{"link", "set", id, "master", hostMasterBridgeNic},
-		{"link", "set", id, "up"},
+		{"link", "set", hostNic, "master", hostMasterBridgeNic},
+		{"link", "set", hostNic, "up"},
 		{"netns", "exec", id, "ip", "link", "set", containerTempNic, "name", "eth0"},
 		{"netns", "exec", id, "ip", "addr", "add", containerIpRange, "dev", "eth0"},
 		{"netns", "exec", id, "ip", "link", "set", "lo", "up"},
 		{"netns", "exec", id, "ip", "link", "set", "eth0", "up"},
 		{"netns", "exec", id, "ip", "route", "add", "default", "via", containerDefaultRouteIP},
 	}
-
 	for _, args := range ipCommands {
-		must(command("ip", args...).Run())
+		if err := command("ip", args...).Run(); err != nil {
+			readyW.Close()
+			must(err)
+			return 1
+		}
 	}
-
-	exe, err := os.Executable()
-	must(err)
-
-	cmd := exec.Command("ip", append([]string{"netns", "exec", os.Args[N_ID], exe, "child"}, os.Args[2:]...)...)
-
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWPID |
-			syscall.CLONE_NEWUTS |
-			syscall.CLONE_NEWNS |
-			syscall.CLONE_NEWIPC,
-	}
-
-	must(cmd.Start())
+	readyW.Close()
 
 	cgroup := filepath.Join("/sys/fs/cgroup", os.Args[N_ID])
 	defer os.Remove(filepath.Join("/sys/fs/cgroup", os.Args[N_ID]))
@@ -173,6 +201,16 @@ func command(name string, args ...string) *exec.Cmd {
 func child() {
 	fmt.Printf("Running %v \n", os.Args[N_CMD:])
 
+	// Wait for parent network to be Ready
+	func() {
+		if ready := os.NewFile(3, "network-ready"); ready == nil {
+			return
+		} else {
+			defer ready.Close()
+			ready.Read([]byte{0}) // wait until parent closes the pipe
+		}
+	}()
+
 	rootfs := os.Args[N_ROOTFS]
 
 	must(syscall.Mount("", "/", "", syscall.MS_PRIVATE|syscall.MS_REC, ""))
@@ -192,18 +230,28 @@ func child() {
 	must(syscall.Mount("tmpfs", "/dev", "tmpfs", syscall.MS_NOSUID, "mode=755"))
 	must(os.MkdirAll("/dev/pts", 0755))
 	must(os.MkdirAll("/dev/shm", 0755))
-	must(syscall.Mount("devpts", "/dev/pts", "devpts", 0, "newinstance,ptmxmode=666,mode=620,gid=5"))
+	must(syscall.Mount("devpts", "/dev/pts", "devpts", 0, "newinstance,ptmxmode=666,mode=620,gid=0"))
 	must(syscall.Mount("tmpfs", "/dev/shm", "tmpfs", syscall.MS_NOSUID|syscall.MS_NODEV, "mode=1777,size=64m"))
 
 	must(os.Chmod("/tmp", 01777))
 
-	must(syscall.Mknod("/dev/null", syscall.S_IFCHR|0666, 1<<8|3))
-	must(syscall.Mknod("/dev/zero", syscall.S_IFCHR|0666, 1<<8|5))
-	must(syscall.Mknod("/dev/full", syscall.S_IFCHR|0666, 1<<8|7))
-	must(syscall.Mknod("/dev/random", syscall.S_IFCHR|0666, 1<<8|8))
-	must(syscall.Mknod("/dev/urandom", syscall.S_IFCHR|0666, 1<<8|9))
-	must(syscall.Mknod("/dev/tty", syscall.S_IFCHR|0666, 5<<8))
-	must(syscall.Mknod("/dev/ptmx", syscall.S_IFCHR|0666, 5<<8|2))
+	for _, dev := range []string{"null", "zero", "full", "random", "urandom", "tty"} {
+		target := filepath.Join("/dev", dev)
+		source := filepath.Join("/oldroot/dev", dev)
+
+		if f, err := os.OpenFile(target, os.O_CREATE, 0666); err != nil {
+			must(err)
+		} else {
+			if err := f.Close(); err != nil {
+				must(err)
+			} else {
+				if err := syscall.Mount(source, target, "", syscall.MS_BIND, ""); err != nil {
+					must(err)
+				}
+			}
+		}
+	}
+	must(os.Symlink("pts/ptmx", "/dev/ptmx"))
 
 	must(syscall.Unmount("/oldroot", syscall.MNT_DETACH))
 	must(os.Remove("/oldroot"))
@@ -216,22 +264,4 @@ func child() {
 	cmd := exec.Command(os.Args[N_CMD], os.Args[N_CMD+1:]...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	os.Exit(exitCode(cmd.Run()))
-}
-
-func exitCode(err error) int {
-	if err == nil {
-		return 0
-	}
-
-	if exitErr, ok := err.(*exec.ExitError); ok {
-		if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
-			if status.Signaled() {
-				return 128 + int(status.Signal())
-			}
-			return status.ExitStatus()
-		}
-	}
-
-	must(err)
-	return 1
 }
