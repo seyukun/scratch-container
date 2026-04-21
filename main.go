@@ -127,7 +127,7 @@ func run() int {
 		return 1
 	}
 
-	hostUID, hostGID, err := hostUserIDs()
+	uidMappings, gidMappings, err := userNamespaceMappings()
 	must(err)
 	readyR, readyW, err := os.Pipe()
 	must(err)
@@ -146,12 +146,8 @@ func run() int {
 			syscall.CLONE_NEWIPC |
 			syscall.CLONE_NEWUSER |
 			syscall.CLONE_NEWNET,
-		UidMappings: []syscall.SysProcIDMap{
-			{ContainerID: 0, HostID: hostUID, Size: 1},
-		},
-		GidMappings: []syscall.SysProcIDMap{
-			{ContainerID: 0, HostID: hostGID, Size: 1},
-		},
+		UidMappings:                uidMappings,
+		GidMappings:                gidMappings,
 		GidMappingsEnableSetgroups: true,
 		Credential:                 &syscall.Credential{Uid: 0, Gid: 0, Groups: []uint32{0}},
 	}
@@ -278,6 +274,7 @@ func child() {
 	must(os.MkdirAll("/dev/shm", 0755))
 	must(syscall.Mount("devpts", "/dev/pts", "devpts", 0, "newinstance,ptmxmode=666,mode=620,gid=0"))
 	must(syscall.Mount("tmpfs", "/dev/shm", "tmpfs", syscall.MS_NOSUID|syscall.MS_NODEV, "mode=1777,size=64m"))
+	must(syscall.Mount("tmpfs", "/run", "tmpfs", syscall.MS_NOSUID|syscall.MS_NODEV, "mode=755"))
 
 	must(os.Chmod("/tmp", 01777))
 

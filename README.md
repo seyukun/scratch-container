@@ -18,6 +18,11 @@ sudo iptables-save | grep -F -- '-A FORWARD -i ctrbr0 -j ACCEPT' || \
         sudo iptables -A FORWARD -i ctrbr0 -j ACCEPT
 sudo iptables-save | grep -F -- '-A FORWARD -o ctrbr0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT' || \
         sudo iptables -A FORWARD -o ctrbr0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+cat <<EOF | tee {HOME}/debootstrap/rootfs/etc/rootfs
+nameserver 1.1.1.1
+nameserver 1.0.0.1
+EOF
 ```
 
 # boot
