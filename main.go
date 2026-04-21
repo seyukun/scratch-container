@@ -92,10 +92,12 @@ func main() {
 	switch os.Args[1] {
 	case "run":
 		os.Exit(run())
-	case "exec":
-		os.Exit(execute())
 	case "child":
 		child()
+	case "exec":
+		os.Exit(execRun())
+	case "exec-child":
+		execChild()
 	default:
 		panic("help")
 	}
@@ -195,7 +197,7 @@ func run() int {
 	return exitCode(cmd.Wait())
 }
 
-func execute() int {
+func execRun() int {
 	if len(os.Args) < 4 {
 		panic("usage: exec <id> <cmd> [args...]")
 	}
@@ -224,14 +226,36 @@ func execute() int {
 		"--root=" + filepath.Join("/proc", pid, "root"),
 		"--setuid", "0",
 		"--setgid", "0",
+		"/proc/self/fd/3",
+		"exec-child",
 	}
 	args = append(args, os.Args[3:]...)
-	cmd := command("nsenter", args...)
+
+	exe, err := os.Open("/proc/self/exe")
+	must(err)
+	defer exe.Close()
+
+	cmd := exec.Command("nsenter", args...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	cmd.ExtraFiles = []*os.File{exe}
 	must(cmd.Start())
 
 	must(os.WriteFile(filepath.Join("/sys/fs/cgroup", id, "cgroup.procs"), []byte(strconv.Itoa(cmd.Process.Pid)), 0700))
 
 	return exitCode(cmd.Wait())
+}
+
+func execChild() {
+	if len(os.Args) < 3 {
+		panic("usage: exec-child <cmd> [args...]")
+	}
+
+	setPrivileges()
+	must(setSeccomp())
+
+	cmd := exec.Command(os.Args[2], os.Args[3:]...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	os.Exit(exitCode(cmd.Run()))
 }
 
 func command(name string, args ...string) *exec.Cmd {
