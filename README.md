@@ -24,5 +24,6 @@ sudo iptables-save | grep -F -- '-A FORWARD -o ctrbr0 -m conntrack --ctstate REL
 rootfsは各コンテナごとにコピーして実行
 ```bash
 go build .
+# usage: run <rootfs> <id> <hostname> <ip/range> <route-ip> <master-br-nic> <cpu-quota> <cpu-period> <mem-M> <cmd> [args...]
 sudo ./scratch-container run ./rootfs test debian 10.200.1.2/24 10.200.1.1 ctrbr0 50000 100000 200M bash -i
 ```
