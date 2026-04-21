@@ -582,3 +582,28 @@ func setPrivileges() {
 		must(prctl(PR_CAPBSET_DROP, uintptr(cap), 0, 0, 0))
 	}
 }
+
+func clearAllInheritableCaps() error {
+	header := capUserHeader{Version: linuxCapabilitiesVersion3}
+	data := [2]capUserData{}
+
+	if _, _, errno := syscall.RawSyscall(syscall.SYS_CAPGET, uintptr(unsafe.Pointer(&header)), uintptr(unsafe.Pointer(&data[0])), 0); errno != 0 {
+		return errno
+	}
+
+	data[0].Inheritable = 0
+	data[1].Inheritable = 0
+
+	if _, _, errno := syscall.RawSyscall(syscall.SYS_CAPSET, uintptr(unsafe.Pointer(&header)), uintptr(unsafe.Pointer(&data[0])), 0); errno != 0 {
+		return errno
+	}
+
+	return nil
+}
+
+func prctl(option int, arg2 uintptr, arg3 uintptr, arg4 uintptr, arg5 uintptr) error {
+	if _, _, errno := syscall.RawSyscall6(syscall.SYS_PRCTL, uintptr(option), arg2, arg3, arg4, arg5, 0); errno != 0 {
+		return errno
+	}
+	return nil
+}

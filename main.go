@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"syscall"
-	"unsafe"
 )
 
 const linuxCapabilitiesVersion3 = 0x20080522
@@ -72,16 +71,16 @@ const (
 )
 
 const (
-	NROOTFS      = 2
-	NID          = 3
-	NHOSTNAME    = 4
-	NIPRANGE     = 5
-	NROUTEIP     = 6
-	NMASTERBRNIC = 7
-	NCPUQUOTA    = 8
-	NCPUPERIOD   = 9
-	NMEM         = 10
-	NCMD         = 11
+	N_ROOTFS      = 2
+	N_ID          = 3
+	N_HOSTNAME    = 4
+	N_IPRANGE     = 5
+	N_ROUTEIP     = 6
+	N_MASTERBRNIC = 7
+	N_CPUQUOTA    = 8
+	N_CPUPERIOD   = 9
+	N_MEM         = 10
+	N_CMD         = 11
 )
 
 func main() {
@@ -91,7 +90,7 @@ func main() {
 
 	switch os.Args[1] {
 	case "run":
-		run()
+		os.Exit(run())
 	case "child":
 		child()
 	default:
@@ -105,13 +104,43 @@ func must(err error) {
 	}
 }
 
-func run() {
-	must(setupNetwork())
+func run() int {
+	id := os.Args[N_ID]
+	containerIpRange := os.Args[N_IPRANGE]
+	containerDefaultRouteIP := os.Args[N_ROUTEIP]
+	hostMasterBridgeNic := os.Args[N_MASTERBRNIC]
+	containerTempNic := rand.Text()[:8]
+
+	// Setup network namespace and veth pair
+	defer command("ip", "netns", "del", id).Run()
+	if err := command("ip", "netns", "add", id).Run(); err != nil {
+		must(err)
+		return 1
+	}
+	defer command("ip", "link", "del", id).Run()
+	if err := command("ip", "link", "add", id, "type", "veth", "peer", "name", containerTempNic).Run(); err != nil {
+		must(err)
+		return 1
+	}
+	ipCommands := [][]string{
+		{"link", "set", containerTempNic, "netns", id},
+		{"link", "set", id, "master", hostMasterBridgeNic},
+		{"link", "set", id, "up"},
+		{"netns", "exec", id, "ip", "link", "set", containerTempNic, "name", "eth0"},
+		{"netns", "exec", id, "ip", "addr", "add", containerIpRange, "dev", "eth0"},
+		{"netns", "exec", id, "ip", "link", "set", "lo", "up"},
+		{"netns", "exec", id, "ip", "link", "set", "eth0", "up"},
+		{"netns", "exec", id, "ip", "route", "add", "default", "via", containerDefaultRouteIP},
+	}
+
+	for _, args := range ipCommands {
+		must(command("ip", args...).Run())
+	}
 
 	exe, err := os.Executable()
 	must(err)
 
-	cmd := exec.Command("ip", append([]string{"netns", "exec", os.Args[NID], exe, "child"}, os.Args[2:]...)...)
+	cmd := exec.Command("ip", append([]string{"netns", "exec", os.Args[N_ID], exe, "child"}, os.Args[2:]...)...)
 
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 
@@ -124,47 +153,15 @@ func run() {
 
 	must(cmd.Start())
 
-	cgroup(cmd.Process.Pid)
-	code := exitCode(cmd.Wait())
-	cleanupNetwork()
-	_ = os.Remove(filepath.Join("/sys/fs/cgroup", os.Args[NID]))
-	os.Exit(code)
-}
+	cgroup := filepath.Join("/sys/fs/cgroup", os.Args[N_ID])
+	defer os.Remove(filepath.Join("/sys/fs/cgroup", os.Args[N_ID]))
+	must(os.MkdirAll(cgroup, 0755))
+	must(os.WriteFile(filepath.Join(cgroup, "pids.max"), []byte("64"), 0700))
+	must(os.WriteFile(filepath.Join(cgroup, "cgroup.procs"), []byte(strconv.Itoa(cmd.Process.Pid)), 0700))
+	must(os.WriteFile(filepath.Join(cgroup, "cpu.max"), []byte(os.Args[N_CPUQUOTA]+" "+os.Args[N_CPUPERIOD]), 0700))
+	must(os.WriteFile(filepath.Join(cgroup, "memory.max"), []byte(os.Args[N_MEM]), 0700))
 
-func setupNetwork() error {
-	id := os.Args[NID]
-	contIPRange := os.Args[NIPRANGE]
-	routeIP := os.Args[NROUTEIP]
-	masterBRNIC := os.Args[NMASTERBRNIC]
-	tmpNIC := rand.Text()[:8]
-
-	commands := [][]string{
-		{"netns", "add", id},
-		{"link", "add", id, "type", "veth", "peer", "name", tmpNIC},
-		{"link", "set", tmpNIC, "netns", id},
-		{"link", "set", id, "master", masterBRNIC},
-		{"link", "set", id, "up"},
-		{"netns", "exec", id, "ip", "link", "set", tmpNIC, "name", "eth0"},
-		{"netns", "exec", id, "ip", "addr", "add", contIPRange, "dev", "eth0"},
-		{"netns", "exec", id, "ip", "link", "set", "lo", "up"},
-		{"netns", "exec", id, "ip", "link", "set", "eth0", "up"},
-		{"netns", "exec", id, "ip", "route", "add", "default", "via", routeIP},
-	}
-
-	for _, args := range commands {
-		if err := command("ip", args...).Run(); err != nil {
-			cleanupNetwork()
-			return err
-		}
-	}
-
-	return nil
-}
-
-func cleanupNetwork() {
-	id := os.Args[NID]
-	_ = command("ip", "link", "del", id).Run()
-	_ = command("ip", "netns", "del", id).Run()
+	return exitCode(cmd.Wait())
 }
 
 func command(name string, args ...string) *exec.Cmd {
@@ -173,19 +170,10 @@ func command(name string, args ...string) *exec.Cmd {
 	return cmd
 }
 
-func cgroup(pid int) {
-	cgroup := filepath.Join("/sys/fs/cgroup", os.Args[NID])
-	must(os.MkdirAll(cgroup, 0755))
-	must(os.WriteFile(filepath.Join(cgroup, "pids.max"), []byte("64"), 0700))
-	must(os.WriteFile(filepath.Join(cgroup, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0700))
-	must(os.WriteFile(filepath.Join(cgroup, "cpu.max"), []byte(os.Args[NCPUQUOTA]+" "+os.Args[NCPUPERIOD]), 0700))
-	must(os.WriteFile(filepath.Join(cgroup, "memory.max"), []byte(os.Args[NMEM]), 0700))
-}
-
 func child() {
-	fmt.Printf("Running %v \n", os.Args[NCMD:])
+	fmt.Printf("Running %v \n", os.Args[N_CMD:])
 
-	rootfs := os.Args[NROOTFS]
+	rootfs := os.Args[N_ROOTFS]
 
 	must(syscall.Mount("", "/", "", syscall.MS_PRIVATE|syscall.MS_REC, ""))
 	must(syscall.Mount(rootfs, rootfs, "", syscall.MS_BIND|syscall.MS_REC, ""))
@@ -208,29 +196,26 @@ func child() {
 	must(syscall.Mount("tmpfs", "/dev/shm", "tmpfs", syscall.MS_NOSUID|syscall.MS_NODEV, "mode=1777,size=64m"))
 
 	must(os.Chmod("/tmp", 01777))
-	mknod("/dev/null", 0666, 1, 3)
-	mknod("/dev/zero", 0666, 1, 5)
-	mknod("/dev/full", 0666, 1, 7)
-	mknod("/dev/random", 0666, 1, 8)
-	mknod("/dev/urandom", 0666, 1, 9)
-	mknod("/dev/tty", 0666, 5, 0)
-	mknod("/dev/ptmx", 0666, 5, 2)
+
+	must(syscall.Mknod("/dev/null", syscall.S_IFCHR|0666, 1<<8|3))
+	must(syscall.Mknod("/dev/zero", syscall.S_IFCHR|0666, 1<<8|5))
+	must(syscall.Mknod("/dev/full", syscall.S_IFCHR|0666, 1<<8|7))
+	must(syscall.Mknod("/dev/random", syscall.S_IFCHR|0666, 1<<8|8))
+	must(syscall.Mknod("/dev/urandom", syscall.S_IFCHR|0666, 1<<8|9))
+	must(syscall.Mknod("/dev/tty", syscall.S_IFCHR|0666, 5<<8))
+	must(syscall.Mknod("/dev/ptmx", syscall.S_IFCHR|0666, 5<<8|2))
 
 	must(syscall.Unmount("/oldroot", syscall.MNT_DETACH))
 	must(os.Remove("/oldroot"))
 
-	must(syscall.Sethostname([]byte(os.Args[NHOSTNAME])))
+	must(syscall.Sethostname([]byte(os.Args[N_HOSTNAME])))
 
 	setPrivileges()
 	must(setSeccomp())
 
-	cmd := exec.Command(os.Args[NCMD], os.Args[NCMD+1:]...)
+	cmd := exec.Command(os.Args[N_CMD], os.Args[N_CMD+1:]...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	safetyExit(cmd.Run())
-}
-
-func safetyExit(err error) {
-	os.Exit(exitCode(err))
+	os.Exit(exitCode(cmd.Run()))
 }
 
 func exitCode(err error) int {
@@ -249,34 +234,4 @@ func exitCode(err error) int {
 
 	must(err)
 	return 1
-}
-
-func clearAllInheritableCaps() error {
-	header := capUserHeader{Version: linuxCapabilitiesVersion3}
-	data := [2]capUserData{}
-
-	if _, _, errno := syscall.RawSyscall(syscall.SYS_CAPGET, uintptr(unsafe.Pointer(&header)), uintptr(unsafe.Pointer(&data[0])), 0); errno != 0 {
-		return errno
-	}
-
-	data[0].Inheritable = 0
-	data[1].Inheritable = 0
-
-	if _, _, errno := syscall.RawSyscall(syscall.SYS_CAPSET, uintptr(unsafe.Pointer(&header)), uintptr(unsafe.Pointer(&data[0])), 0); errno != 0 {
-		return errno
-	}
-
-	return nil
-}
-
-func prctl(option int, arg2 uintptr, arg3 uintptr, arg4 uintptr, arg5 uintptr) error {
-	if _, _, errno := syscall.RawSyscall6(syscall.SYS_PRCTL, uintptr(option), arg2, arg3, arg4, arg5, 0); errno != 0 {
-		return errno
-	}
-	return nil
-}
-
-func mknod(path string, perm uint32, major int, minor int) {
-	dev := major<<8 | minor
-	must(syscall.Mknod(path, syscall.S_IFCHR|perm, dev))
 }
