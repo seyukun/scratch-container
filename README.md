@@ -5,7 +5,7 @@
 sudo apt install -y debian-archive-keyring iptables-persistent
 if [ ! -d ${HOME}/debootstrap/rootfs ]; then
     sudo debootstrap stable rootfs http://ftp.udx.icscoe.jp/Linux/debian
-    sudo chown -R ubuntu:ubuntu rootfs
+    sudo chown -R $USER:$USER rootfs
 fi
 sudo ip link add ctrbr0 type bridge || echo "may be ok"
 sudo ip addr add 10.200.1.1/24 dev ctrbr0 || echo "may be ok"
