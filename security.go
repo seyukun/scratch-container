@@ -566,11 +566,9 @@ func setPrivileges() {
 		CAP_KILL:             true,
 		CAP_SETGID:           true,
 		CAP_SETUID:           true,
-		CAP_SETPCAP:          true,
 		CAP_NET_BIND_SERVICE: true,
 		CAP_NET_RAW:          true,
 		CAP_SYS_CHROOT:       true,
-		CAP_MKNOD:            true,
 		CAP_AUDIT_WRITE:      true,
 		CAP_SETFCAP:          true,
 	}
