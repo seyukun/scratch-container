@@ -27,3 +27,10 @@ go build .
 # usage: run <rootfs> <id> <hostname> <ip/range> <route-ip> <master-br-nic> <cpu-quota> <cpu-period> <mem-M> <cmd> [args...]
 sudo ./scratch-container run ./rootfs test debian 10.200.1.2/24 10.200.1.1 ctrbr0 50000 100000 200M bash -i
 ```
+
+# exec
+別ターミナルから実行中のコンテナに入る
+```bash
+# usage: exec <id> <cmd> [args...]
+sudo ./scratch-container exec test bash -i
+```

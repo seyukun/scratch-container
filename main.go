@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 )
 
@@ -84,13 +85,15 @@ const (
 )
 
 func main() {
-	if len(os.Args) < 12 {
+	if len(os.Args) < 2 {
 		panic("usage: run <rootfs> <id> <hostname> <ip/range> <route-ip> <master-br-nic> <cpu-quota> <cpu-period> <mem-M> <cmd> [args...]")
 	}
 
 	switch os.Args[1] {
 	case "run":
 		os.Exit(run())
+	case "exec":
+		os.Exit(execute())
 	case "child":
 		child()
 	default:
@@ -105,6 +108,10 @@ func must(err error) {
 }
 
 func run() int {
+	if len(os.Args) < 12 {
+		panic("usage: run <rootfs> <id> <hostname> <ip/range> <route-ip> <master-br-nic> <cpu-quota> <cpu-period> <mem-M> <cmd> [args...]")
+	}
+
 	id := os.Args[N_ID]
 	containerIpRange := os.Args[N_IPRANGE]
 	containerDefaultRouteIP := os.Args[N_ROUTEIP]
@@ -188,6 +195,45 @@ func run() int {
 	must(os.WriteFile(filepath.Join(cgroup, "cgroup.procs"), []byte(strconv.Itoa(cmd.Process.Pid)), 0700))
 	must(os.WriteFile(filepath.Join(cgroup, "cpu.max"), []byte(os.Args[N_CPUQUOTA]+" "+os.Args[N_CPUPERIOD]), 0700))
 	must(os.WriteFile(filepath.Join(cgroup, "memory.max"), []byte(os.Args[N_MEM]), 0700))
+
+	return exitCode(cmd.Wait())
+}
+
+func execute() int {
+	if len(os.Args) < 4 {
+		panic("usage: exec <id> <cmd> [args...]")
+	}
+
+	id := os.Args[2]
+	pid := ""
+	if data, err := os.ReadFile(filepath.Join("/sys/fs/cgroup", id, "cgroup.procs")); err != nil {
+		must(err)
+	} else {
+		pids := strings.Fields(string(data))
+		if len(pids) == 0 {
+			fmt.Fprintf(os.Stderr, "container %q has no processes\n", id)
+			return 1
+		}
+		pid = pids[0]
+	}
+
+	args := []string{
+		"--target", pid,
+		"--user",
+		"--mount",
+		"--uts",
+		"--ipc",
+		"--net",
+		"--pid",
+		"--root=" + filepath.Join("/proc", pid, "root"),
+		"--setuid", "0",
+		"--setgid", "0",
+	}
+	args = append(args, os.Args[3:]...)
+	cmd := command("nsenter", args...)
+	must(cmd.Start())
+
+	must(os.WriteFile(filepath.Join("/sys/fs/cgroup", id, "cgroup.procs"), []byte(strconv.Itoa(cmd.Process.Pid)), 0700))
 
 	return exitCode(cmd.Wait())
 }
