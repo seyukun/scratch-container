@@ -32,7 +32,7 @@ rootfsは各コンテナごとにコピーして実行
 go build .
 
 
-cp ${HOME}/debootstrap/rootfs ./rootfs
+cp -r ${HOME}/debootstrap/rootfs ./rootfs
 
 # usage: run <rootfs> <id> <hostname> <ip/range> <route-ip> <master-br-nic> <cpu-quota> <cpu-period> <mem-M> <cmd> [args...]
 sudo ./scratch-container run ./rootfs test debian 10.200.1.2/24 10.200.1.1 ctrbr0 50000 100000 200M bash -i
