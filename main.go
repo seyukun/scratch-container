@@ -5,6 +5,7 @@ package main
 import (
 	"crypto/rand"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -93,11 +94,11 @@ func main() {
 	case "run":
 		os.Exit(run())
 	case "child":
-		child()
+		os.Exit(child())
 	case "exec":
 		os.Exit(execRun())
 	case "exec-child":
-		execChild()
+		os.Exit(execChild())
 	default:
 		panic("help")
 	}
@@ -125,157 +126,94 @@ func run() int {
 		fmt.Fprintf(os.Stderr, "network namespace %q already exists\n", id)
 		return 1
 	} else if !os.IsNotExist(err) {
-		must(err)
+		fmt.Fprintf(os.Stderr, "failed to stat network namespace %q: %v\n", id, err)
 		return 1
 	}
 
 	uidMappings, gidMappings, err := userNamespaceMappings()
 	must(err)
+
 	readyR, readyW, err := os.Pipe()
 	must(err)
 	defer readyR.Close()
 	defer readyW.Close()
 
 	cmd := exec.Command("/proc/self/exe", append([]string{"child"}, os.Args[2:]...)...)
-
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	cmd.ExtraFiles = []*os.File{readyR} // readyR = fd 3
-
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWPID |
-			syscall.CLONE_NEWUTS |
-			syscall.CLONE_NEWNS |
-			syscall.CLONE_NEWIPC |
-			syscall.CLONE_NEWUSER |
-			syscall.CLONE_NEWNET,
-		UidMappings:                uidMappings,
-		GidMappings:                gidMappings,
-		GidMappingsEnableSetgroups: true,
-		Credential:                 &syscall.Credential{Uid: 0, Gid: 0, Groups: []uint32{0}},
+	{
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+		cmd.ExtraFiles = []*os.File{readyR}
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			Cloneflags: syscall.CLONE_NEWPID |
+				syscall.CLONE_NEWUTS |
+				syscall.CLONE_NEWNS |
+				syscall.CLONE_NEWIPC |
+				syscall.CLONE_NEWUSER |
+				syscall.CLONE_NEWNET,
+			UidMappings:                uidMappings,
+			GidMappings:                gidMappings,
+			GidMappingsEnableSetgroups: true,
+			Credential:                 &syscall.Credential{Uid: 0, Gid: 0, Groups: []uint32{0}},
+		}
+		must(cmd.Start())
 	}
 
-	must(cmd.Start())
 	readyR.Close()
 
-	must(command("ip", "netns", "attach", id, strconv.Itoa(cmd.Process.Pid)).Run())
-	defer command("ip", "netns", "del", id).Run()
-
-	if err := command("ip", "link", "add", hostNic, "type", "veth", "peer", "name", containerTempNic).Run(); err != nil {
-		readyW.Close()
-		must(err)
-		return 1
-	}
-	defer command("ip", "link", "del", hostNic).Run()
-
-	ipCommands := [][]string{
-		{"link", "set", containerTempNic, "netns", id},
-		{"link", "set", hostNic, "master", hostMasterBridgeNic},
-		{"link", "set", hostNic, "up"},
-		{"netns", "exec", id, "ip", "link", "set", containerTempNic, "name", "eth0"},
-		{"netns", "exec", id, "ip", "addr", "add", containerIpRange, "dev", "eth0"},
-		{"netns", "exec", id, "ip", "link", "set", "lo", "up"},
-		{"netns", "exec", id, "ip", "link", "set", "eth0", "up"},
-		{"netns", "exec", id, "ip", "route", "add", "default", "via", containerDefaultRouteIP},
-	}
-	for _, args := range ipCommands {
-		if err := command("ip", args...).Run(); err != nil {
-			readyW.Close()
-			must(err)
-			return 1
+	{
+		must(command("ip", "netns", "attach", id, strconv.Itoa(cmd.Process.Pid)).Run())
+		defer func() {
+			must(command("ip", "netns", "del", id).Run())
+			fmt.Println("ip netns del", id)
+		}()
+		must(command("ip", "link", "add", hostNic, "type", "veth", "peer", "name", containerTempNic).Run())
+		defer func() {
+			must(command("ip", "link", "del", hostNic).Run())
+			fmt.Println("ip link del", hostNic)
+		}()
+		ipCommands := [][]string{
+			{"link", "set", containerTempNic, "netns", id},
+			{"link", "set", hostNic, "master", hostMasterBridgeNic},
+			{"link", "set", hostNic, "up"},
+			{"netns", "exec", id, "ip", "link", "set", containerTempNic, "name", "eth0"},
+			{"netns", "exec", id, "ip", "addr", "add", containerIpRange, "dev", "eth0"},
+			{"netns", "exec", id, "ip", "link", "set", "lo", "up"},
+			{"netns", "exec", id, "ip", "link", "set", "eth0", "up"},
+			{"netns", "exec", id, "ip", "route", "add", "default", "via", containerDefaultRouteIP},
+		}
+		for _, args := range ipCommands {
+			must(command("ip", args...).Run())
 		}
 	}
+
 	readyW.Close()
 
-	cgroup := filepath.Join("/sys/fs/cgroup", os.Args[N_ID])
-	defer os.Remove(filepath.Join("/sys/fs/cgroup", os.Args[N_ID]))
-	must(os.MkdirAll(cgroup, 0755))
-	must(os.WriteFile(filepath.Join(cgroup, "pids.max"), []byte("64"), 0700))
-	must(os.WriteFile(filepath.Join(cgroup, "cgroup.procs"), []byte(strconv.Itoa(cmd.Process.Pid)), 0700))
-	must(os.WriteFile(filepath.Join(cgroup, "cpu.max"), []byte(os.Args[N_CPUQUOTA]+" "+os.Args[N_CPUPERIOD]), 0700))
-	must(os.WriteFile(filepath.Join(cgroup, "memory.max"), []byte(os.Args[N_MEM]), 0700))
+	{
+		cgroup := filepath.Join("/sys/fs/cgroup", os.Args[N_ID])
+		defer os.Remove(filepath.Join("/sys/fs/cgroup", os.Args[N_ID]))
+		must(os.MkdirAll(cgroup, 0755))
+		must(os.WriteFile(filepath.Join(cgroup, "pids.max"), []byte("64"), 0700))
+		must(os.WriteFile(filepath.Join(cgroup, "cgroup.procs"), []byte(strconv.Itoa(cmd.Process.Pid)), 0700))
+		must(os.WriteFile(filepath.Join(cgroup, "cpu.max"), []byte(os.Args[N_CPUQUOTA]+" "+os.Args[N_CPUPERIOD]), 0700))
+		must(os.WriteFile(filepath.Join(cgroup, "memory.max"), []byte(os.Args[N_MEM]), 0700))
+	}
+
+	fmt.Println("Waiting for end the process")
 
 	return exitCode(cmd.Wait())
 }
 
-func execRun() int {
-	if len(os.Args) < 4 {
-		panic("usage: exec <id> <cmd> [args...]")
-	}
-
-	id := os.Args[2]
-	pid := ""
-	if data, err := os.ReadFile(filepath.Join("/sys/fs/cgroup", id, "cgroup.procs")); err != nil {
-		must(err)
-	} else {
-		pids := strings.Fields(string(data))
-		if len(pids) == 0 {
-			fmt.Fprintf(os.Stderr, "container %q has no processes\n", id)
-			return 1
-		}
-		pid = pids[0]
-	}
-
-	args := []string{
-		"--target", pid,
-		"--user",
-		"--mount",
-		"--uts",
-		"--ipc",
-		"--net",
-		"--pid",
-		"--root=" + filepath.Join("/proc", pid, "root"),
-		"--setuid", "0",
-		"--setgid", "0",
-		"/proc/self/fd/3",
-		"exec-child",
-	}
-	args = append(args, os.Args[3:]...)
-
-	exe, err := os.Open("/proc/self/exe")
-	must(err)
-	defer exe.Close()
-
-	cmd := exec.Command("nsenter", args...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	cmd.ExtraFiles = []*os.File{exe}
-	must(cmd.Start())
-
-	must(os.WriteFile(filepath.Join("/sys/fs/cgroup", id, "cgroup.procs"), []byte(strconv.Itoa(cmd.Process.Pid)), 0700))
-
-	return exitCode(cmd.Wait())
-}
-
-func execChild() {
-	if len(os.Args) < 3 {
-		panic("usage: exec-child <cmd> [args...]")
-	}
-
-	setPrivileges()
-	must(setSeccomp())
-
-	cmd := exec.Command(os.Args[2], os.Args[3:]...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	os.Exit(exitCode(cmd.Run()))
-}
-
-func command(name string, args ...string) *exec.Cmd {
-	cmd := exec.Command(name, args...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	return cmd
-}
-
-func child() {
+func child() int {
 	fmt.Printf("Running %v \n", os.Args[N_CMD:])
 
 	// Wait for parent network to be Ready
-	func() {
-		if ready := os.NewFile(3, "network-ready"); ready == nil {
-			return
-		} else {
-			defer ready.Close()
-			ready.Read([]byte{0}) // wait until parent closes the pipe
+	if fReady := os.NewFile(3, "NETWORK_READY"); fReady == nil {
+		panic("failed to open network ready pipe")
+	} else {
+		defer fReady.Close()
+		if _, err := io.ReadAll(fReady); err != nil {
+			panic(err)
 		}
-	}()
+	}
 
 	rootfs := os.Args[N_ROOTFS]
 
@@ -385,5 +323,67 @@ func child() {
 
 	cmd := exec.Command(os.Args[N_CMD], os.Args[N_CMD+1:]...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	os.Exit(exitCode(cmd.Run()))
+
+	return exitCode(cmd.Run())
+}
+
+func execRun() int {
+	if len(os.Args) < 4 {
+		panic("usage: exec <id> <cmd> [args...]")
+	}
+
+	id := os.Args[2]
+	pid := ""
+	if data, err := os.ReadFile(filepath.Join("/sys/fs/cgroup", id, "cgroup.procs")); err != nil {
+		must(err)
+	} else {
+		pids := strings.Fields(string(data))
+		if len(pids) == 0 {
+			fmt.Fprintf(os.Stderr, "container %q has no processes\n", id)
+			return 1
+		}
+		pid = pids[0]
+	}
+
+	args := []string{
+		"--target", pid,
+		"--user",
+		"--mount",
+		"--uts",
+		"--ipc",
+		"--net",
+		"--pid",
+		"--root=" + filepath.Join("/proc", pid, "root"),
+		"--setuid", "0",
+		"--setgid", "0",
+		"/proc/self/fd/3",
+		"exec-child",
+	}
+	args = append(args, os.Args[3:]...)
+
+	exe, err := os.Open("/proc/self/exe")
+	must(err)
+	defer exe.Close()
+
+	cmd := exec.Command("nsenter", args...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	cmd.ExtraFiles = []*os.File{exe}
+	must(cmd.Start())
+
+	must(os.WriteFile(filepath.Join("/sys/fs/cgroup", id, "cgroup.procs"), []byte(strconv.Itoa(cmd.Process.Pid)), 0700))
+
+	return exitCode(cmd.Wait())
+}
+
+func execChild() int {
+	if len(os.Args) < 3 {
+		panic("usage: exec-child <cmd> [args...]")
+	}
+
+	setPrivileges()
+	must(setSeccomp())
+
+	cmd := exec.Command(os.Args[2], os.Args[3:]...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	return exitCode(cmd.Run())
 }

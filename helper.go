@@ -120,3 +120,9 @@ func exitCode(err error) int {
 	must(err)
 	return 1
 }
+
+func command(name string, args ...string) *exec.Cmd {
+	cmd := exec.Command(name, args...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	return cmd
+}
