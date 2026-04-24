@@ -201,15 +201,15 @@ func run() int {
 }
 
 func child() int {
-	fmt.Printf("Running %v \n", os.Args[N_CMD:])
-
 	// Wait for parent network to be Ready
-	if fReady := os.NewFile(3, "NETWORK_READY"); fReady == nil {
-		panic("failed to open network ready pipe")
-	} else {
-		defer fReady.Close()
-		if _, err := io.ReadAll(fReady); err != nil {
-			panic(err)
+	{
+		if fReady := os.NewFile(3, "NETWORK_READY"); fReady == nil {
+			panic("failed to open network ready pipe")
+		} else {
+			defer fReady.Close()
+			if _, err := io.ReadAll(fReady); err != nil {
+				panic(err)
+			}
 		}
 	}
 
@@ -229,67 +229,73 @@ func child() int {
 	must(syscall.Mount("proc", "/proc", "proc", 0, ""))
 	must(syscall.Mount("sysfs", "/sys", "sysfs", syscall.MS_RDONLY|syscall.MS_NOSUID|syscall.MS_NODEV|syscall.MS_NOEXEC, ""))
 
-	masked := []string{
-		"/proc/acpi",
-		"/proc/kcore",
-		"/proc/keys",
-		"/proc/latency_stats",
-		"/proc/sched_debug",
-		"/proc/scsi",
-		"/proc/timer_list",
-		"/proc/timer_stats",
-		"/proc/sysrq-trigger",
-		"/sys/devices/virtual/powercap",
-		"/sys/firmware",
-		"/sys/fs/cgroup",
-		"/sys/kernel/config",
-		"/sys/kernel/debug",
-		"/sys/kernel/security",
-		"/sys/kernel/tracing",
-		"/sys/module",
-		"/sys/power",
-	}
-	for _, target := range masked {
-		info, err := os.Stat(target)
-		if err != nil {
-			if os.IsNotExist(err) {
+	{
+		masked := []string{
+			"/proc/acpi",
+			"/proc/kcore",
+			"/proc/keys",
+			"/proc/latency_stats",
+			"/proc/sched_debug",
+			"/proc/scsi",
+			"/proc/timer_list",
+			"/proc/timer_stats",
+			"/proc/sysrq-trigger",
+			"/sys/devices/virtual/powercap",
+			"/sys/firmware",
+			"/sys/fs/cgroup",
+			"/sys/kernel/config",
+			"/sys/kernel/debug",
+			"/sys/kernel/security",
+			"/sys/kernel/tracing",
+			"/sys/module",
+			"/sys/power",
+		}
+		for _, target := range masked {
+			info, err := os.Stat(target)
+			if err != nil {
+				if os.IsNotExist(err) {
+					continue
+				}
+				must(err)
+			}
+
+			if info.IsDir() {
+				must(syscall.Mount("tmpfs", target, "tmpfs", syscall.MS_RDONLY|syscall.MS_NOSUID|syscall.MS_NODEV|syscall.MS_NOEXEC, "mode=755"))
 				continue
 			}
-			must(err)
+			must(syscall.Mount("/oldroot/dev/null", target, "", syscall.MS_BIND|syscall.MS_RDONLY, ""))
 		}
-
-		if info.IsDir() {
-			must(syscall.Mount("tmpfs", target, "tmpfs", syscall.MS_RDONLY|syscall.MS_NOSUID|syscall.MS_NODEV|syscall.MS_NOEXEC, "mode=755"))
-			continue
-		}
-		must(syscall.Mount("/oldroot/dev/null", target, "", syscall.MS_BIND|syscall.MS_RDONLY, ""))
 	}
 
-	readonly := []string{
-		"/proc/asound",
-		"/proc/bus",
-		"/proc/fs",
-		"/proc/irq",
-		"/proc/sys",
-		"/proc/sysvipc",
-	}
-	for _, target := range readonly {
-		if _, err := os.Stat(target); err != nil {
-			if os.IsNotExist(err) {
-				continue
+	{
+		readonly := []string{
+			"/proc/asound",
+			"/proc/bus",
+			"/proc/fs",
+			"/proc/irq",
+			"/proc/sys",
+			"/proc/sysvipc",
+		}
+		for _, target := range readonly {
+			if _, err := os.Stat(target); err != nil {
+				if os.IsNotExist(err) {
+					continue
+				}
+				must(err)
 			}
-			must(err)
+			must(syscall.Mount(target, target, "", syscall.MS_BIND|syscall.MS_REC, ""))
+			must(syscall.Mount(target, target, "", syscall.MS_BIND|syscall.MS_REMOUNT|syscall.MS_RDONLY|syscall.MS_REC, ""))
 		}
-		must(syscall.Mount(target, target, "", syscall.MS_BIND|syscall.MS_REC, ""))
-		must(syscall.Mount(target, target, "", syscall.MS_BIND|syscall.MS_REMOUNT|syscall.MS_RDONLY|syscall.MS_REC, ""))
 	}
 
-	must(syscall.Mount("tmpfs", "/dev", "tmpfs", syscall.MS_NOSUID, "mode=755"))
-	must(os.MkdirAll("/dev/pts", 0755))
-	must(os.MkdirAll("/dev/shm", 0755))
-	must(syscall.Mount("devpts", "/dev/pts", "devpts", 0, "newinstance,ptmxmode=666,mode=620,gid=0"))
-	must(syscall.Mount("tmpfs", "/dev/shm", "tmpfs", syscall.MS_NOSUID|syscall.MS_NODEV, "mode=1777,size=64m"))
-	must(syscall.Mount("tmpfs", "/run", "tmpfs", syscall.MS_NOSUID|syscall.MS_NODEV, "mode=755"))
+	{
+		must(syscall.Mount("tmpfs", "/dev", "tmpfs", syscall.MS_NOSUID, "mode=755"))
+		must(os.MkdirAll("/dev/pts", 0755))
+		must(os.MkdirAll("/dev/shm", 0755))
+		must(syscall.Mount("devpts", "/dev/pts", "devpts", 0, "newinstance,ptmxmode=666,mode=620,gid=0"))
+		must(syscall.Mount("tmpfs", "/dev/shm", "tmpfs", syscall.MS_NOSUID|syscall.MS_NODEV, "mode=1777,size=64m"))
+		must(syscall.Mount("tmpfs", "/run", "tmpfs", syscall.MS_NOSUID|syscall.MS_NODEV, "mode=755"))
+	}
 
 	must(os.Chmod("/tmp", 01777))
 
