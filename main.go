@@ -150,7 +150,6 @@ func run() int {
 				syscall.CLONE_NEWIPC |
 				syscall.CLONE_NEWUSER |
 				syscall.CLONE_NEWNET,
-			Setpgid:                    true,
 			UidMappings:                uidMappings,
 			GidMappings:                gidMappings,
 			GidMappingsEnableSetgroups: true,
@@ -320,10 +319,10 @@ func child() int {
 	setPrivileges()
 	must(setSeccomp())
 
-	cmd := exec.Command(os.Args[N_CMD], os.Args[N_CMD+1:]...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-
-	return exitCode(cmd.Run())
+	binary, err := exec.LookPath(os.Args[N_CMD])
+	must(err)
+	must(syscall.Exec(binary, os.Args[N_CMD:], os.Environ()))
+	panic("unreachable")
 }
 
 func execRun() int {
@@ -367,7 +366,6 @@ func execRun() int {
 	cmd := exec.Command("nsenter", args...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	cmd.ExtraFiles = []*os.File{exe}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	must(cmd.Start())
 
 	signalEnd := make(chan struct{})
@@ -388,9 +386,10 @@ func execChild() int {
 	setPrivileges()
 	must(setSeccomp())
 
-	cmd := exec.Command(os.Args[2], os.Args[3:]...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	return exitCode(cmd.Run())
+	binary, err := exec.LookPath(os.Args[2])
+	must(err)
+	must(syscall.Exec(binary, os.Args[2:], os.Environ()))
+	panic("unreachable")
 }
 
 func signalForward(cmd *exec.Cmd, end chan struct{}) {
@@ -406,9 +405,6 @@ func signalForward(cmd *exec.Cmd, end chan struct{}) {
 			}
 			if sysSig, ok := sig.(syscall.Signal); ok {
 				target := cmd.Process.Pid
-				if cmd.SysProcAttr != nil && cmd.SysProcAttr.Setpgid {
-					target = -target
-				}
 				syscall.Kill(target, sysSig)
 			}
 		case <-end:
