@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -149,6 +150,7 @@ func run() int {
 				syscall.CLONE_NEWIPC |
 				syscall.CLONE_NEWUSER |
 				syscall.CLONE_NEWNET,
+			Setpgid:                    true,
 			UidMappings:                uidMappings,
 			GidMappings:                gidMappings,
 			GidMappingsEnableSetgroups: true,
@@ -157,19 +159,16 @@ func run() int {
 		must(cmd.Start())
 	}
 
+	signalEnd := make(chan struct{})
+	go signalForward(cmd, signalEnd)
+
 	readyR.Close()
 
 	{
 		must(command("ip", "netns", "attach", id, strconv.Itoa(cmd.Process.Pid)).Run())
-		defer func() {
-			must(command("ip", "netns", "del", id).Run())
-			fmt.Println("ip netns del", id)
-		}()
+		defer command("ip", "netns", "del", id).Run()
 		must(command("ip", "link", "add", hostNic, "type", "veth", "peer", "name", containerTempNic).Run())
-		defer func() {
-			must(command("ip", "link", "del", hostNic).Run())
-			fmt.Println("ip link del", hostNic)
-		}()
+		defer command("ip", "link", "del", hostNic).Run()
 		ipCommands := [][]string{
 			{"link", "set", containerTempNic, "netns", id},
 			{"link", "set", hostNic, "master", hostMasterBridgeNic},
@@ -197,9 +196,9 @@ func run() int {
 		must(os.WriteFile(filepath.Join(cgroup, "memory.max"), []byte(os.Args[N_MEM]), 0700))
 	}
 
-	fmt.Println("Waiting for end the process")
-
-	return exitCode(cmd.Wait())
+	result := cmd.Wait()
+	close(signalEnd)
+	return exitCode(result)
 }
 
 func child() int {
@@ -368,11 +367,17 @@ func execRun() int {
 	cmd := exec.Command("nsenter", args...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	cmd.ExtraFiles = []*os.File{exe}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	must(cmd.Start())
+
+	signalEnd := make(chan struct{})
+	go signalForward(cmd, signalEnd)
 
 	must(os.WriteFile(filepath.Join("/sys/fs/cgroup", id, "cgroup.procs"), []byte(strconv.Itoa(cmd.Process.Pid)), 0700))
 
-	return exitCode(cmd.Wait())
+	result := cmd.Wait()
+	close(signalEnd)
+	return exitCode(result)
 }
 
 func execChild() int {
@@ -386,4 +391,28 @@ func execChild() int {
 	cmd := exec.Command(os.Args[2], os.Args[3:]...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	return exitCode(cmd.Run())
+}
+
+func signalForward(cmd *exec.Cmd, end chan struct{}) {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
+	defer signal.Stop(signals)
+
+	for {
+		select {
+		case sig := <-signals:
+			if cmd.Process == nil {
+				continue
+			}
+			if sysSig, ok := sig.(syscall.Signal); ok {
+				target := cmd.Process.Pid
+				if cmd.SysProcAttr != nil && cmd.SysProcAttr.Setpgid {
+					target = -target
+				}
+				syscall.Kill(target, sysSig)
+			}
+		case <-end:
+			return
+		}
+	}
 }
