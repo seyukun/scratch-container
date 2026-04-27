@@ -1,5 +1,9 @@
 use crate::{security, user_namespace};
 use scopeguard::{ScopeGuard, defer, guard};
+use signal_hook::{
+    consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM},
+    iterator::Signals,
+};
 use std::{
     env,
     error::Error,
@@ -12,6 +16,7 @@ use std::{
     },
     path::Path,
     process::{Command, ExitCode},
+    thread,
 };
 use sys_mount::{Mount, MountFlags, UnmountFlags, unmount};
 
@@ -102,6 +107,21 @@ pub fn run<'a>(mut args: impl Iterator<Item = &'a String>) -> Result<ExitCode, B
 
     drop(rfd);
 
+    // signal handler
+
+    let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP, SIGQUIT])?;
+    let signals_handle = signals.handle();
+
+    let signal_thread = thread::spawn(move || {
+        for signal in signals.forever() {
+            let _ = unsafe { libc::kill(pid, signal.into()) };
+        }
+    });
+    defer! {
+        signals_handle.close();
+        let _ = signal_thread.join();
+    }
+
     // user namespace
     let (uid_mappings, gid_mappings) = user_namespace::mappings()?;
     let uid_map = uid_mappings
@@ -155,8 +175,16 @@ pub fn run<'a>(mut args: impl Iterator<Item = &'a String>) -> Result<ExitCode, B
 
     // wait exited
     let mut status = 0;
-    if unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
-        return Err(io::Error::last_os_error().into());
+    loop {
+        let result = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if result >= 0 {
+            break;
+        }
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        return Err(err.into());
     }
 
     if libc::WIFEXITED(status) {
