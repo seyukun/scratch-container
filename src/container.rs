@@ -108,7 +108,6 @@ pub fn run<'a>(mut args: impl Iterator<Item = &'a String>) -> Result<ExitCode, B
     drop(rfd);
 
     // signal handler
-
     let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP, SIGQUIT])?;
     let signals_handle = signals.handle();
 
