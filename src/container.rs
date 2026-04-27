@@ -1,19 +1,15 @@
 use crate::{security, user_namespace};
-use scopeguard::guard;
-use scopeguard::{ScopeGuard, *};
-use std::fs::File;
-use std::io::{PipeReader, PipeWriter};
-use std::os::fd::FromRawFd;
+use scopeguard::{ScopeGuard, defer, guard};
 use std::{
     env,
+    error::Error,
     ffi::CString,
-    fs, io,
-    io::ErrorKind,
-    io::Read,
-    os::fd::{AsRawFd, OwnedFd, RawFd},
-    os::unix,
-    os::unix::fs::PermissionsExt,
-    os::unix::process::CommandExt,
+    fs,
+    io::{self, ErrorKind, PipeReader, Read},
+    os::{
+        fd::{self, AsRawFd, FromRawFd},
+        unix::{self, fs::PermissionsExt, process::CommandExt},
+    },
     path::Path,
     process::{Command, ExitCode},
 };
@@ -26,12 +22,10 @@ struct ChildConfig {
     hostname: String,
     cmd: String,
     cmd_args: Vec<String>,
-    pipefd: (RawFd, RawFd),
+    pipefd: (fd::RawFd, fd::RawFd),
 }
 
-pub fn run<'a>(
-    mut args: impl Iterator<Item = &'a String>,
-) -> Result<ExitCode, Box<dyn std::error::Error>> {
+pub fn run<'a>(mut args: impl Iterator<Item = &'a String>) -> Result<ExitCode, Box<dyn Error>> {
     let Some(arg_rootfs) = args.next() else {
         return Err("rootfs argument is required".into());
     };
@@ -65,7 +59,7 @@ pub fn run<'a>(
     let cmd_args: Vec<String> = args.cloned().collect();
 
     let netns_path = Path::new("/var/run/netns").join(arg_id);
-    match std::fs::metadata(&netns_path) {
+    match fs::metadata(&netns_path) {
         Ok(_) => {
             return Err(format!("network namespace {arg_id:?} already exists").into());
         }
@@ -179,9 +173,9 @@ extern "C" fn child_run_c(arg: *mut libc::c_void) -> libc::c_int {
     0
 }
 
-fn child_run(config: ChildConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let rfd = unsafe { OwnedFd::from_raw_fd(config.pipefd.0) };
-    let wfd = unsafe { OwnedFd::from_raw_fd(config.pipefd.1) };
+fn child_run(config: ChildConfig) -> Result<(), Box<dyn Error>> {
+    let rfd = unsafe { fd::OwnedFd::from_raw_fd(config.pipefd.0) };
+    let wfd = unsafe { fd::OwnedFd::from_raw_fd(config.pipefd.1) };
     let mut rfd = PipeReader::try_from(rfd)?;
     drop(wfd);
 
@@ -357,7 +351,7 @@ fn setup_network(
     ctr_pid: &str,
     hst_nic: &str,
     ctr_nic: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn Error>> {
     ip(&["netns", "attach", id, ctr_pid])?;
     let cleanup_netns = guard(id, |id| {
         let _ = ip(&["netns", "del", id]);
@@ -391,14 +385,14 @@ fn setup_network(
     Ok(())
 }
 
-fn cleanup_network(arg_id: &str, host_nic: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn cleanup_network(arg_id: &str, host_nic: &str) -> Result<(), Box<dyn Error>> {
     let _ = ip(&["link", "del", host_nic]);
     let _ = ip(&["netns", "del", arg_id]);
 
     Ok(())
 }
 
-fn ip(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
+fn ip(args: &[&str]) -> Result<(), Box<dyn Error>> {
     let status = Command::new("ip").args(args).status()?;
     if !status.success() {
         return Err(format!("[FAILED] ip {args:?}: \n{status}").into());
