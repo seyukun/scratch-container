@@ -1,3 +1,4 @@
-/bak
-/rootfs
-/scratch-container
+go
+rootfs
+target
+container
