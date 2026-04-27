@@ -19,9 +19,9 @@ use std::{
 use sys_mount::{Mount, MountFlags, UnmountFlags, unmount};
 mod cgroup;
 mod clone;
-mod helper;
 mod id_map;
 mod network;
+use super::helper;
 use super::security;
 
 const CHILD_STACK_SIZE: usize = 1024 * 1024;
