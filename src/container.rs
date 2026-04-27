@@ -159,7 +159,15 @@ pub fn run<'a>(mut args: impl Iterator<Item = &'a String>) -> Result<ExitCode, B
         return Err(io::Error::last_os_error().into());
     }
 
-    Ok(ExitCode::SUCCESS)
+    if libc::WIFEXITED(status) {
+        return Ok(ExitCode::from(libc::WEXITSTATUS(status) as u8));
+    }
+
+    if libc::WIFSIGNALED(status) {
+        return Ok(ExitCode::from((128 + libc::WTERMSIG(status)) as u8));
+    }
+
+    Ok(ExitCode::FAILURE)
 }
 
 extern "C" fn child_run_c(arg: *mut libc::c_void) -> libc::c_int {
