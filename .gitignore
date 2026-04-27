@@ -1,4 +1,4 @@
-go
-rootfs
-target
-container
+/go
+/rootfs
+/target
+/container

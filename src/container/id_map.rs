@@ -7,7 +7,26 @@ pub struct SysProcIdMap {
     pub size: u32,
 }
 
-pub fn mappings() -> Result<(Vec<SysProcIdMap>, Vec<SysProcIdMap>), Box<dyn Error>> {
+pub fn apply(pid: i32) -> Result<(), Box<dyn Error>> {
+    let (uid_mappings, gid_mappings) = mappings()?;
+
+    let uid_map = uid_mappings
+        .iter()
+        .map(|map| format!("{} {} {}\n", map.container_id, map.host_id, map.size))
+        .collect::<String>();
+    let gid_map = gid_mappings
+        .iter()
+        .map(|map| format!("{} {} {}\n", map.container_id, map.host_id, map.size))
+        .collect::<String>();
+
+    fs::write(format!("/proc/{pid}/setgroups"), "allow")?;
+    fs::write(format!("/proc/{pid}/uid_map"), uid_map)?;
+    fs::write(format!("/proc/{pid}/gid_map"), gid_map)?;
+
+    Ok(())
+}
+
+fn mappings() -> Result<(Vec<SysProcIdMap>, Vec<SysProcIdMap>), Box<dyn Error>> {
     let host_uid = host_uid()?;
     let host_gid = host_gid()?;
 

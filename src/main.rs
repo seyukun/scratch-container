@@ -1,7 +1,7 @@
 use std::process::ExitCode;
 mod container;
+mod exec;
 mod security;
-mod user_namespace;
 
 const RUN_USAGE: &str = "run <rootfs> <id> <hostname> <ip/range> <route-ip> <master-br-nic> <cpu-quota> <cpu-period> <mem-M> <cmd> [args...]";
 const EXEC_USAGE: &str = "exec <id> <cmd> [args...]";

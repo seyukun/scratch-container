@@ -1,5 +1,4 @@
-use crate::{security, user_namespace};
-use scopeguard::{ScopeGuard, defer, guard};
+use scopeguard::defer;
 use signal_hook::{
     consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM},
     iterator::Signals,
@@ -7,7 +6,6 @@ use signal_hook::{
 use std::{
     env,
     error::Error,
-    ffi::CString,
     fs,
     io::{self, ErrorKind, PipeReader, Read},
     os::{
@@ -19,6 +17,12 @@ use std::{
     thread,
 };
 use sys_mount::{Mount, MountFlags, UnmountFlags, unmount};
+mod cgroup;
+mod clone;
+mod helper;
+mod id_map;
+mod network;
+use super::security;
 
 const CHILD_STACK_SIZE: usize = 1024 * 1024;
 
@@ -75,45 +79,32 @@ pub fn run<'a>(mut args: impl Iterator<Item = &'a String>) -> Result<ExitCode, B
     }
 
     // pipe
-    let pipefd = io::pipe()?;
-    let (rfd, wfd) = pipefd;
+    let (rfd, wfd) = io::pipe()?;
 
-    // clone
+    // clone and isolate
     let mut stack = vec![0_u8; CHILD_STACK_SIZE];
-    let config = Box::new(ChildConfig {
-        rootfs: arg_rootfs.clone(),
-        hostname: arg_hostname.clone(),
-        cmd: arg_cmd.clone(),
-        cmd_args,
-        pipefd: (rfd.as_raw_fd(), wfd.as_raw_fd()),
-    });
-    let pid = unsafe {
-        libc::clone(
-            child_run_c,
-            stack.as_mut_ptr().add(stack.len()).cast(),
-            libc::SIGCHLD
-                | libc::CLONE_NEWPID
-                | libc::CLONE_NEWUTS
-                | libc::CLONE_NEWNS
-                | libc::CLONE_NEWIPC
-                | libc::CLONE_NEWUSER
-                | libc::CLONE_NEWNET,
-            Box::into_raw(config).cast(),
-        )
-    };
-    if pid < 0 {
-        return Err(io::Error::last_os_error().into());
-    }
+    let pid = clone::isolate(
+        child,
+        &mut stack,
+        ChildConfig {
+            rootfs: arg_rootfs.clone(),
+            hostname: arg_hostname.clone(),
+            cmd: arg_cmd.clone(),
+            cmd_args,
+            pipefd: (rfd.as_raw_fd(), wfd.as_raw_fd()),
+        },
+    )?;
+
+    id_map::apply(pid)?;
 
     drop(rfd);
 
     // signal handler
     let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP, SIGQUIT])?;
     let signals_handle = signals.handle();
-
     let signal_thread = thread::spawn(move || {
         for signal in signals.forever() {
-            let _ = unsafe { libc::kill(pid, signal.into()) };
+            let _ = helper::kill(pid, signal);
         }
     });
     defer! {
@@ -121,75 +112,42 @@ pub fn run<'a>(mut args: impl Iterator<Item = &'a String>) -> Result<ExitCode, B
         let _ = signal_thread.join();
     }
 
-    // user namespace
-    let (uid_mappings, gid_mappings) = user_namespace::mappings()?;
-    let uid_map = uid_mappings
-        .iter()
-        .map(|map| format!("{} {} {}\n", map.container_id, map.host_id, map.size))
-        .collect::<String>();
-    let gid_map = gid_mappings
-        .iter()
-        .map(|map| format!("{} {} {}\n", map.container_id, map.host_id, map.size))
-        .collect::<String>();
-    fs::write(format!("/proc/{pid}/setgroups"), "allow")?;
-    fs::write(format!("/proc/{pid}/uid_map"), uid_map)?;
-    fs::write(format!("/proc/{pid}/gid_map"), gid_map)?;
-
     // network
     let host_nic = format!("veth-{pid}");
-    setup_network(
+    let ctr_nic = format!("ct-{pid}");
+    network::setup(
         arg_id,
         arg_ip_range,
         arg_route_ip,
         arg_master_br_nic,
         &pid.to_string(),
         &host_nic,
-        &format!("ct-{pid}"),
+        &ctr_nic,
     )?;
-    defer!(if let Err(err) = cleanup_network(arg_id, &host_nic) {
+    defer!(if let Err(err) = network::cleanup(arg_id, &host_nic) {
         eprintln!("failed to cleanup network: {err}");
     });
 
     // cgroup
-    let cgroup = Path::new("/sys/fs/cgroup").join(arg_id);
-    fs::create_dir_all(&cgroup)?;
-    defer!(if let Err(err) = fs::remove_dir(&cgroup) {
-        let content = fs::read_to_string(&cgroup)
-            .unwrap_or_else(|_| "<failed to read cgroup content>".to_string());
-        eprintln!(
-            "failed to cleanup cgroup: {err} ({} > remaining processes: {content})",
-            cgroup.display()
-        );
+    let cgroup = cgroup::setup(arg_id, pid, arg_cpu_quota, arg_cpu_period, arg_mem_limit)?;
+    defer!(if let Err(err) = cgroup::cleanup(&cgroup) {
+        eprintln!("failed to cleanup {}: {err}", cgroup.display());
     });
-    let pids_max = "64";
-    let cgroup_pids = pid.to_string();
-    let cpu_max = format!("{arg_cpu_quota} {arg_cpu_period}");
-    fs::write(cgroup.join("pids.max"), pids_max)?;
-    fs::write(cgroup.join("cgroup.procs"), cgroup_pids)?;
-    fs::write(cgroup.join("cpu.max"), cpu_max)?;
-    fs::write(cgroup.join("memory.max"), arg_mem_limit)?;
 
     // goback
     drop(wfd);
 
     // wait exited
     let mut status = 0;
-    loop {
-        let result = unsafe { libc::waitpid(pid, &mut status, 0) };
-        if result >= 0 {
-            break;
-        }
+    while unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
         let err = io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EINTR) {
-            continue;
+        if err.raw_os_error() != Some(libc::EINTR) {
+            return Err(err.into());
         }
-        return Err(err.into());
     }
-
     if libc::WIFEXITED(status) {
         return Ok(ExitCode::from(libc::WEXITSTATUS(status) as u8));
     }
-
     if libc::WIFSIGNALED(status) {
         return Ok(ExitCode::from((128 + libc::WTERMSIG(status)) as u8));
     }
@@ -197,18 +155,7 @@ pub fn run<'a>(mut args: impl Iterator<Item = &'a String>) -> Result<ExitCode, B
     Ok(ExitCode::FAILURE)
 }
 
-extern "C" fn child_run_c(arg: *mut libc::c_void) -> libc::c_int {
-    let config = unsafe { Box::from_raw(arg.cast::<ChildConfig>()) };
-
-    if let Err(err) = child_run(*config) {
-        eprintln!("{err}");
-        return 1;
-    }
-
-    0
-}
-
-fn child_run(config: ChildConfig) -> Result<(), Box<dyn Error>> {
+fn child(config: ChildConfig) -> Result<(), Box<dyn Error>> {
     let rfd = unsafe { fd::OwnedFd::from_raw_fd(config.pipefd.0) };
     let wfd = unsafe { fd::OwnedFd::from_raw_fd(config.pipefd.1) };
     let mut rfd = PipeReader::try_from(rfd)?;
@@ -248,14 +195,9 @@ fn child_run(config: ChildConfig) -> Result<(), Box<dyn Error>> {
         .to_str()
         .ok_or("failed to convert oldroot path to string")?
         .to_string();
-    let c_rootfs = CString::new(config.rootfs.as_str())?;
-    let c_oldroot = CString::new(oldroot.as_str())?;
-    let result =
-        unsafe { libc::syscall(libc::SYS_pivot_root, c_rootfs.as_ptr(), c_oldroot.as_ptr()) };
-    if result < 0 {
-        return Err(io::Error::last_os_error().into());
-    }
+    helper::pivot_root(&config.rootfs, &oldroot)?;
 
+    // mount proc/sysfs/devtmpfs and bind mount some proc/sys entries
     env::set_current_dir("/")?;
     Mount::builder().fstype("proc").mount("proc", "/proc")?;
     Mount::builder()
@@ -300,7 +242,6 @@ fn child_run(config: ChildConfig) -> Result<(), Box<dyn Error>> {
                 .mount("/oldroot/dev/null", target)?;
         }
     }
-
     for target in [
         "/proc/asound",
         "/proc/bus",
@@ -318,6 +259,7 @@ fn child_run(config: ChildConfig) -> Result<(), Box<dyn Error>> {
         Mount::builder().flags(flag).mount(target, target)?;
     }
 
+    // setup dev
     Mount::builder()
         .fstype("tmpfs")
         .flags(MountFlags::NOSUID)
@@ -359,16 +301,7 @@ fn child_run(config: ChildConfig) -> Result<(), Box<dyn Error>> {
     unmount("/oldroot", UnmountFlags::DETACH)?;
     fs::remove_dir("/oldroot")?;
 
-    if unsafe {
-        libc::sethostname(
-            config.hostname.as_ptr().cast::<libc::c_char>(),
-            config.hostname.len(),
-        )
-    } < 0
-    {
-        return Err(io::Error::last_os_error().into());
-    }
-
+    helper::set_hostname(&config.hostname)?;
     security::set_privileges()?;
     security::set_seccomp()?;
 
@@ -376,62 +309,4 @@ fn child_run(config: ChildConfig) -> Result<(), Box<dyn Error>> {
         .args(&config.cmd_args)
         .exec()
         .into())
-}
-
-fn setup_network(
-    id: &str,
-    ip_range: &str,
-    route: &str,
-    mstr_br_nic: &str,
-    ctr_pid: &str,
-    hst_nic: &str,
-    ctr_nic: &str,
-) -> Result<(), Box<dyn Error>> {
-    ip(&["netns", "attach", id, ctr_pid])?;
-    let cleanup_netns = guard(id, |id| {
-        let _ = ip(&["netns", "del", id]);
-    });
-
-    ip(&[
-        "link", "add", hst_nic, "type", "veth", "peer", "name", ctr_nic,
-    ])?;
-    let cleanup_host_nic = guard(hst_nic, |nic| {
-        let _ = ip(&["link", "del", nic]);
-    });
-
-    ip(&["link", "set", ctr_nic, "netns", id])?;
-    ip(&["link", "set", hst_nic, "master", mstr_br_nic])?;
-    ip(&["link", "set", hst_nic, "up"])?;
-    ip(&[
-        "netns", "exec", id, "ip", "link", "set", ctr_nic, "name", "eth0",
-    ])?;
-    ip(&[
-        "netns", "exec", id, "ip", "addr", "add", ip_range, "dev", "eth0",
-    ])?;
-    ip(&["netns", "exec", id, "ip", "link", "set", "lo", "up"])?;
-    ip(&["netns", "exec", id, "ip", "link", "set", "eth0", "up"])?;
-    ip(&[
-        "netns", "exec", id, "ip", "route", "add", "default", "via", route,
-    ])?;
-
-    ScopeGuard::into_inner(cleanup_netns);
-    ScopeGuard::into_inner(cleanup_host_nic);
-
-    Ok(())
-}
-
-fn cleanup_network(arg_id: &str, host_nic: &str) -> Result<(), Box<dyn Error>> {
-    let _ = ip(&["link", "del", host_nic]);
-    let _ = ip(&["netns", "del", arg_id]);
-
-    Ok(())
-}
-
-fn ip(args: &[&str]) -> Result<(), Box<dyn Error>> {
-    let status = Command::new("ip").args(args).status()?;
-    if !status.success() {
-        return Err(format!("[FAILED] ip {args:?}: \n{status}").into());
-    }
-
-    Ok(())
 }
