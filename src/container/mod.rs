@@ -1,4 +1,5 @@
 use nix::{
+    errno::Errno,
     fcntl::AT_FDCWD,
     mount::{MntFlags, MsFlags, mount, umount2},
     sys::{
@@ -200,7 +201,10 @@ fn child(config: ChildConfig) -> Result<(), Box<dyn Error>> {
         None::<&str>,
     )?;
     for dir in ["proc", "sys", "dev", "run", "tmp", "oldroot"] {
-        unistd::mkdir(&rootfs.join(dir), Mode::from_bits_truncate(0o755))?;
+        match unistd::mkdir(&rootfs.join(dir), Mode::from_bits_truncate(0o755)) {
+            Ok(()) | Err(Errno::EEXIST) => {}
+            Err(err) => return Err(err.into()),
+        }
     }
     unistd::pivot_root(rootfs, &rootfs.join("oldroot"))?;
 
