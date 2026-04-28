@@ -1,4 +1,4 @@
-use nix::{sched::CloneFlags, sys::signal::Signal, unistd::Pid};
+use nix::{sched::CloneFlags, sched::clone, sys::signal::Signal, unistd::Pid};
 use std::error::Error;
 
 pub fn isolate<T>(
@@ -11,26 +11,28 @@ where
 {
     let mut args = Some(args);
     let callback = Box::new(move || {
-        let Some(args) = args.take() else {
-            eprintln!("clone callback was called more than once");
-            return 1;
+        let args = match args.take() {
+            None => {
+                eprintln!("clone callback was called more than once");
+                return 1;
+            }
+            Some(args) => args,
         };
-
-        if let Err(err) = func(args) {
-            eprintln!("{err}");
-            return 1;
+        match func(args) {
+            Err(err) => {
+                eprintln!("{err}");
+                1
+            }
+            Ok(()) => 0,
         }
-
-        0
     });
 
-    let pid = unsafe {
-        nix::sched::clone(
+    Ok(unsafe {
+        clone(
             callback,
             stack,
             CloneFlags::empty(),
             Some(Signal::SIGCHLD as i32),
         )?
-    };
-    Ok(pid)
+    })
 }

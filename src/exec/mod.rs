@@ -18,11 +18,13 @@ struct ExecConfig {
 }
 
 pub fn run<'a>(mut args: impl Iterator<Item = &'a String>) -> Result<ExitCode, Box<dyn Error>> {
-    let Some(id) = args.next() else {
-        return Err("id argument is required".into());
+    let id = match args.next() {
+        Some(id) => id,
+        None => return Err("<id> is required".into()),
     };
-    let Some(cmd) = args.next() else {
-        return Err("cmd argument is required".into());
+    let cmd = match args.next() {
+        Some(cmd) => cmd,
+        None => return Err("<cmd> is required".into()),
     };
 
     let cgroup_procs_path = Path::new("/sys/fs/cgroup").join(id).join("cgroup.procs");

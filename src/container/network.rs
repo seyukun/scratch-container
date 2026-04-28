@@ -51,10 +51,9 @@ pub fn cleanup(arg_id: &str, host_nic: &str) -> Result<(), Box<dyn Error>> {
 }
 
 fn ip(args: &[&str]) -> Result<(), Box<dyn Error>> {
-    let status = Command::new("ip").args(args).status()?;
-    if !status.success() {
-        return Err(format!("[FAILED] ip {args:?}: \n{status}").into());
+    match Command::new("ip").args(args).status() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => return Err(format!("[FAILED] ip {args:?}: \n{status}").into()),
+        Err(err) => return Err(format!("[FAILED] ip {args:?}: \n{err}").into()),
     }
-
-    Ok(())
 }
