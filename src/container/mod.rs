@@ -347,7 +347,7 @@ fn child(config: ChildConfig) -> Result<(), Box<dyn Error>> {
     unistd::symlinkat("pts/ptmx", AT_FDCWD, "/dev/ptmx")?;
 
     umount2("/oldroot", MntFlags::MNT_DETACH)?;
-    unistd::unlinkat(AT_FDCWD, "/oldroot", unistd::UnlinkatFlags::RemoveDir)?;
+    fs::remove_dir("/oldroot")?;
 
     unistd::sethostname(&config.hostname)?;
     security::set_privileges()?;
