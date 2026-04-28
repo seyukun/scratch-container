@@ -5,10 +5,7 @@ pub(super) fn isolate<T>(
     func: fn(T) -> Result<(), Box<dyn Error>>,
     stack: &mut [u8],
     args: T,
-) -> Result<Pid, Box<dyn Error>>
-where
-    T: 'static,
-{
+) -> Result<Pid, Box<dyn Error>> {
     let mut args = Some(args);
     let callback = Box::new(move || {
         let args = match args.take() {

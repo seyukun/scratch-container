@@ -1,5 +1,11 @@
 use nix::{
-    sys::{signal::Signal, wait},
+    fcntl::AT_FDCWD,
+    mount::{MntFlags, MsFlags, mount, umount2},
+    sys::{
+        signal::{self, Signal},
+        stat::{self, FchmodatFlags, Mode},
+        wait,
+    },
     unistd,
 };
 use scopeguard::defer;
@@ -8,24 +14,21 @@ use signal_hook::{
     iterator::Signals,
 };
 use std::{
-    env,
     error::Error,
     fs,
-    io::{self, ErrorKind, PipeReader, Read},
+    io::{ErrorKind, PipeReader, PipeWriter, Read},
     os::{
-        fd::{self, AsRawFd, FromRawFd},
-        unix::{self, fs::PermissionsExt, process::CommandExt},
+        fd::{self, AsRawFd, FromRawFd, OwnedFd, RawFd},
+        unix::process::CommandExt,
     },
     path::Path,
     process::{Command, ExitCode},
     thread,
 };
-use sys_mount::{Mount, MountFlags, UnmountFlags, unmount};
 mod cgroup;
 mod clone;
 mod id_map;
 mod network;
-use super::helper;
 use super::security;
 
 const CHILD_STACK_SIZE: usize = 1024 * 1024;
@@ -35,7 +38,7 @@ struct ChildConfig {
     hostname: String,
     cmd: String,
     cmd_args: Vec<String>,
-    pipefd: (fd::RawFd, fd::RawFd),
+    pipefd: (RawFd, RawFd),
 }
 
 pub fn run<'a>(mut args: impl Iterator<Item = &'a String>) -> Result<ExitCode, Box<dyn Error>> {
@@ -83,7 +86,7 @@ pub fn run<'a>(mut args: impl Iterator<Item = &'a String>) -> Result<ExitCode, B
     }
 
     // pipe
-    let (rfd, wfd) = io::pipe()?;
+    let (rfd, wfd) = unistd::pipe()?;
 
     // clone and isolate
     let mut stack = vec![0_u8; CHILD_STACK_SIZE];
@@ -115,7 +118,7 @@ pub fn run<'a>(mut args: impl Iterator<Item = &'a String>) -> Result<ExitCode, B
                     continue;
                 }
             };
-            match helper::kill(pid, sig) {
+            match signal::kill(pid, sig) {
                 Ok(()) => {}
                 Err(err) => eprintln!("failed to forward signal {} to container: {err}", sig),
             }
@@ -160,9 +163,12 @@ pub fn run<'a>(mut args: impl Iterator<Item = &'a String>) -> Result<ExitCode, B
 }
 
 fn child(config: ChildConfig) -> Result<(), Box<dyn Error>> {
-    let rfd = unsafe { fd::OwnedFd::from_raw_fd(config.pipefd.0) };
-    let wfd = unsafe { fd::OwnedFd::from_raw_fd(config.pipefd.1) };
-    let mut rfd = PipeReader::try_from(rfd)?;
+    let (mut rfd, wfd) = unsafe {
+        (
+            PipeReader::try_from(fd::OwnedFd::from_raw_fd(config.pipefd.0))?,
+            PipeWriter::try_from(fd::OwnedFd::from_raw_fd(config.pipefd.1))?,
+        )
+    };
     drop(wfd);
 
     // goto -> setup-child-process -> comeback
@@ -178,31 +184,42 @@ fn child(config: ChildConfig) -> Result<(), Box<dyn Error>> {
     unistd::setuid(root_uid)?;
 
     // mount pivot_root
-    Mount::builder()
-        .flags(MountFlags::from_bits_retain(
-            libc::MS_PRIVATE | libc::MS_REC,
-        ))
-        .mount("", "/")?;
-    Mount::builder()
-        .flags(MountFlags::BIND | MountFlags::REC)
-        .mount(&config.rootfs, &config.rootfs)?;
+    let rootfs = Path::new(&config.rootfs);
+    mount(
+        None::<&str>,
+        "/",
+        None::<&str>,
+        MsFlags::MS_PRIVATE | MsFlags::MS_REC,
+        None::<&str>,
+    )?;
+    mount(
+        Some(rootfs),
+        rootfs,
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_REC,
+        None::<&str>,
+    )?;
     for dir in ["proc", "sys", "dev", "run", "tmp", "oldroot"] {
-        fs::create_dir_all(Path::new(&config.rootfs).join(dir))?;
+        unistd::mkdir(&rootfs.join(dir), Mode::from_bits_truncate(0o755))?;
     }
-    let oldroot = Path::new(&config.rootfs)
-        .join("oldroot")
-        .to_str()
-        .ok_or("failed to convert oldroot path to string")?
-        .to_string();
-    helper::pivot_root(&config.rootfs, &oldroot)?;
+    unistd::pivot_root(rootfs, &rootfs.join("oldroot"))?;
 
     // mount proc/sysfs/devtmpfs and bind mount some proc/sys entries
-    env::set_current_dir("/")?;
-    Mount::builder().fstype("proc").mount("proc", "/proc")?;
-    Mount::builder()
-        .fstype("sysfs")
-        .flags(MountFlags::RDONLY | MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC)
-        .mount("sysfs", "/sys")?;
+    unistd::chdir("/")?;
+    mount(
+        Some("proc"),
+        "/proc",
+        Some("proc"),
+        MsFlags::empty(),
+        None::<&str>,
+    )?;
+    mount(
+        Some("sysfs"),
+        "/sys",
+        Some("sysfs"),
+        MsFlags::MS_RDONLY | MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+        None::<&str>,
+    )?;
     for target in [
         "/proc/acpi",
         "/proc/kcore",
@@ -223,22 +240,26 @@ fn child(config: ChildConfig) -> Result<(), Box<dyn Error>> {
         "/sys/module",
         "/sys/power",
     ] {
-        let Ok(info) = fs::metadata(target) else {
-            continue;
+        let metadata = match fs::metadata(target) {
+            Ok(m) => m,
+            Err(_) => continue,
         };
-        if info.is_dir() {
-            let flag =
-                MountFlags::RDONLY | MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC;
-            Mount::builder()
-                .fstype("tmpfs")
-                .flags(flag)
-                .data("mode=755")
-                .mount("tmpfs", target)?;
+        if metadata.is_dir() {
+            mount(
+                Some("tmpfs"),
+                target,
+                Some("tmpfs"),
+                MsFlags::MS_RDONLY | MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+                Some("mode=755"),
+            )?;
         } else {
-            let flag = MountFlags::BIND | MountFlags::RDONLY;
-            Mount::builder()
-                .flags(flag)
-                .mount("/oldroot/dev/null", target)?;
+            mount(
+                Some("/oldroot/dev/null"),
+                target,
+                None::<&str>,
+                MsFlags::MS_BIND | MsFlags::MS_RDONLY,
+                None::<&str>,
+            )?;
         }
     }
     for target in [
@@ -249,58 +270,86 @@ fn child(config: ChildConfig) -> Result<(), Box<dyn Error>> {
         "/proc/sys",
         "/proc/sysvipc",
     ] {
-        let Ok(_) = fs::metadata(target) else {
-            continue;
-        };
-        let flag = MountFlags::BIND | MountFlags::REC;
-        Mount::builder().flags(flag).mount(target, target)?;
-        let flag = MountFlags::BIND | MountFlags::REMOUNT | MountFlags::RDONLY | MountFlags::REC;
-        Mount::builder().flags(flag).mount(target, target)?;
+        match fs::metadata(target) {
+            Ok(_) => {}
+            Err(_) => continue,
+        }
+        mount(
+            Some(target),
+            target,
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_REC,
+            None::<&str>,
+        )?;
+        mount(
+            Some(target),
+            target,
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY | MsFlags::MS_REC,
+            None::<&str>,
+        )?;
     }
 
     // setup dev
-    Mount::builder()
-        .fstype("tmpfs")
-        .flags(MountFlags::NOSUID)
-        .data("mode=755")
-        .mount("tmpfs", "/dev")?;
-    fs::create_dir_all("/dev/pts")?;
-    fs::create_dir_all("/dev/shm")?;
-    Mount::builder()
-        .fstype("devpts")
-        .data("newinstance,ptmxmode=666,mode=620,gid=0")
-        .mount("devpts", "/dev/pts")?;
-    Mount::builder()
-        .fstype("tmpfs")
-        .flags(MountFlags::NOSUID | MountFlags::NODEV)
-        .data("mode=1777,size=64m")
-        .mount("tmpfs", "/dev/shm")?;
-    Mount::builder()
-        .fstype("tmpfs")
-        .flags(MountFlags::NOSUID | MountFlags::NODEV)
-        .data("mode=755")
-        .mount("tmpfs", "/run")?;
+    mount(
+        Some("tmpfs"),
+        "/dev",
+        Some("tmpfs"),
+        MsFlags::MS_NOSUID,
+        Some("mode=755"),
+    )?;
+    unistd::mkdir("/dev/pts", Mode::from_bits_truncate(0o755))?;
+    unistd::mkdir("/dev/shm", Mode::from_bits_truncate(0o755))?;
+    mount(
+        Some("devpts"),
+        "/dev/pts",
+        Some("devpts"),
+        MsFlags::empty(),
+        Some("newinstance,ptmxmode=666,mode=620,gid=0"),
+    )?;
+    mount(
+        Some("tmpfs"),
+        "/dev/shm",
+        Some("tmpfs"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+        Some("mode=1777,size=64m"),
+    )?;
+    mount(
+        Some("tmpfs"),
+        "/run",
+        Some("tmpfs"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+        Some("mode=755"),
+    )?;
 
-    fs::set_permissions("/tmp", fs::Permissions::from_mode(0o1777))?;
+    stat::fchmodat(
+        AT_FDCWD,
+        "/tmp",
+        Mode::from_bits_truncate(0o1777),
+        FchmodatFlags::FollowSymlink,
+    )?;
 
     for dev in ["null", "zero", "full", "random", "urandom", "tty"] {
         let target = Path::new("/dev").join(dev);
         let source = Path::new("/oldroot/dev").join(dev);
-
         fs::OpenOptions::new()
             .create(true)
             .write(true)
             .open(&target)?;
-        Mount::builder()
-            .flags(MountFlags::BIND)
-            .mount(source, target)?;
+        mount(
+            Some(&source),
+            &target,
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        )?;
     }
-    unix::fs::symlink("pts/ptmx", "/dev/ptmx")?;
+    unistd::symlinkat("pts/ptmx", AT_FDCWD, "/dev/ptmx")?;
 
-    unmount("/oldroot", UnmountFlags::DETACH)?;
-    fs::remove_dir("/oldroot")?;
+    umount2("/oldroot", MntFlags::MNT_DETACH)?;
+    unistd::unlinkat(AT_FDCWD, "/oldroot", unistd::UnlinkatFlags::RemoveDir)?;
 
-    helper::set_hostname(&config.hostname)?;
+    unistd::sethostname(&config.hostname)?;
     security::set_privileges()?;
     security::set_seccomp()?;
 
