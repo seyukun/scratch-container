@@ -16,10 +16,10 @@ use signal_hook::{
 use std::{
     error::Error,
     fs,
-    io::{ErrorKind, PipeReader, PipeWriter, Read},
+    io::{self, Read as _},
     os::{
-        fd::{self, AsRawFd, FromRawFd, OwnedFd, RawFd},
-        unix::process::CommandExt,
+        fd::{self, AsRawFd as _, FromRawFd as _},
+        unix::process::CommandExt as _,
     },
     path::Path,
     process::{Command, ExitCode},
@@ -38,7 +38,7 @@ struct ChildConfig {
     hostname: String,
     cmd: String,
     cmd_args: Vec<String>,
-    pipefd: (RawFd, RawFd),
+    pipefd: (fd::RawFd, fd::RawFd),
 }
 
 pub fn run<'a>(mut args: impl Iterator<Item = &'a String>) -> Result<ExitCode, Box<dyn Error>> {
@@ -79,7 +79,7 @@ pub fn run<'a>(mut args: impl Iterator<Item = &'a String>) -> Result<ExitCode, B
         Ok(_) => {
             return Err(format!("network namespace {arg_id:?} already exists").into());
         }
-        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => {
             return Err(format!("failed to stat network namespace {arg_id:?}: {err}").into());
         }
@@ -165,8 +165,8 @@ pub fn run<'a>(mut args: impl Iterator<Item = &'a String>) -> Result<ExitCode, B
 fn child(config: ChildConfig) -> Result<(), Box<dyn Error>> {
     let (mut rfd, wfd) = unsafe {
         (
-            PipeReader::try_from(fd::OwnedFd::from_raw_fd(config.pipefd.0))?,
-            PipeWriter::try_from(fd::OwnedFd::from_raw_fd(config.pipefd.1))?,
+            io::PipeReader::try_from(fd::OwnedFd::from_raw_fd(config.pipefd.0))?,
+            io::PipeWriter::try_from(fd::OwnedFd::from_raw_fd(config.pipefd.1))?,
         )
     };
     drop(wfd);
