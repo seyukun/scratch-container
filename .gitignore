@@ -1,5 +1,7 @@
 /go
 /rootfs
+/rootfses
+/debootstrap
 /target
 /container
 __pycache__/
