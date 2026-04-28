@@ -321,14 +321,6 @@ fn child(config: ChildConfig) -> Result<(), Box<dyn Error>> {
         MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
         Some("mode=755"),
     )?;
-
-    stat::fchmodat(
-        AT_FDCWD,
-        "/tmp",
-        Mode::from_bits_truncate(0o1777),
-        FchmodatFlags::FollowSymlink,
-    )?;
-
     for dev in ["null", "zero", "full", "random", "urandom", "tty"] {
         let target = Path::new("/dev").join(dev);
         let source = Path::new("/oldroot/dev").join(dev);
@@ -345,6 +337,14 @@ fn child(config: ChildConfig) -> Result<(), Box<dyn Error>> {
         )?;
     }
     unistd::symlinkat("pts/ptmx", AT_FDCWD, "/dev/ptmx")?;
+
+    // tmp dir
+    stat::fchmodat(
+        AT_FDCWD,
+        "/tmp",
+        Mode::from_bits_truncate(0o1777),
+        FchmodatFlags::FollowSymlink,
+    )?;
 
     umount2("/oldroot", MntFlags::MNT_DETACH)?;
     fs::remove_dir("/oldroot")?;
