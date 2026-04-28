@@ -5,7 +5,14 @@ edition = "2024"
 
 [dependencies]
 libc = "0.2.186"
-nix = { version = "0.31.2", features = ["fs", "sched", "user"] }
+nix = { version = "0.31.2", features = [
+    "fs",
+    "hostname",
+    "sched",
+    "signal",
+    "user",
+    "mount",
+] }
 scopeguard = "1.2.0"
 signal-hook = "0.4.4"
 sys-mount = "3.1.0"

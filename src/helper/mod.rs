@@ -1,5 +1,10 @@
 use std::{error::Error, ffi::CString, io};
 
+use nix::{
+    sys::signal::{self, Signal},
+    unistd::{self, Pid},
+};
+
 pub fn pivot_root(new_root: &str, old_root: &str) -> Result<(), Box<dyn Error>> {
     let new_root = CString::new(new_root)?;
     let old_root = CString::new(old_root)?;
@@ -9,16 +14,12 @@ pub fn pivot_root(new_root: &str, old_root: &str) -> Result<(), Box<dyn Error>> 
     Ok(())
 }
 
-pub fn kill(pid: libc::pid_t, signal: i32) -> Result<(), Box<dyn Error>> {
-    if unsafe { libc::kill(pid, signal.into()) } < 0 {
-        return Err(io::Error::last_os_error().into());
-    }
+pub fn kill(pid: Pid, signal: Signal) -> Result<(), Box<dyn Error>> {
+    signal::kill(pid, signal)?;
     Ok(())
 }
 
 pub fn set_hostname(hostname: &str) -> Result<(), Box<dyn Error>> {
-    if unsafe { libc::sethostname(hostname.as_ptr().cast::<libc::c_char>(), hostname.len()) } < 0 {
-        return Err(io::Error::last_os_error().into());
-    }
+    unistd::sethostname(hostname)?;
     Ok(())
 }

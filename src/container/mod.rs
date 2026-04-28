@@ -1,3 +1,7 @@
+use nix::{
+    sys::{signal::Signal, wait},
+    unistd,
+};
 use scopeguard::defer;
 use signal_hook::{
     consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM},
@@ -100,11 +104,21 @@ pub fn run<'a>(mut args: impl Iterator<Item = &'a String>) -> Result<ExitCode, B
     drop(rfd);
 
     // signal handler
-    let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP, SIGQUIT])?;
+    let mut signals = Signals::new([SIGHUP, SIGINT, SIGQUIT, SIGTERM])?;
     let signals_handle = signals.handle();
     let signal_thread = thread::spawn(move || {
-        for signal in signals.forever() {
-            let _ = helper::kill(pid, signal);
+        for sig in signals.forever() {
+            let sig = match Signal::try_from(sig) {
+                Ok(signal) => signal,
+                Err(_) => {
+                    eprintln!("received invalid signal: {}", sig);
+                    continue;
+                }
+            };
+            match helper::kill(pid, sig) {
+                Ok(()) => {}
+                Err(err) => eprintln!("failed to forward signal {} to container: {err}", sig),
+            }
         }
     });
     defer! {
@@ -138,21 +152,11 @@ pub fn run<'a>(mut args: impl Iterator<Item = &'a String>) -> Result<ExitCode, B
     drop(wfd);
 
     // wait exited
-    let mut status = 0;
-    while unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::EINTR) {
-            return Err(err.into());
-        }
+    match wait::waitpid(pid, None)? {
+        wait::WaitStatus::Exited(_, status) => Ok(ExitCode::from(status as u8)),
+        wait::WaitStatus::Signaled(_, signal, _) => Ok(ExitCode::from((128 + signal as i32) as u8)),
+        _ => Ok(ExitCode::FAILURE),
     }
-    if libc::WIFEXITED(status) {
-        return Ok(ExitCode::from(libc::WEXITSTATUS(status) as u8));
-    }
-    if libc::WIFSIGNALED(status) {
-        return Ok(ExitCode::from((128 + libc::WTERMSIG(status)) as u8));
-    }
-
-    Ok(ExitCode::FAILURE)
 }
 
 fn child(config: ChildConfig) -> Result<(), Box<dyn Error>> {
@@ -167,16 +171,11 @@ fn child(config: ChildConfig) -> Result<(), Box<dyn Error>> {
     drop(rfd);
 
     // set uid/gid
-    let groups = [0 as libc::gid_t];
-    if unsafe { libc::setgroups(groups.len(), groups.as_ptr()) } < 0 {
-        return Err(io::Error::last_os_error().into());
-    }
-    if unsafe { libc::setgid(0) } < 0 {
-        return Err(io::Error::last_os_error().into());
-    }
-    if unsafe { libc::setuid(0) } < 0 {
-        return Err(io::Error::last_os_error().into());
-    }
+    let root_gid = unistd::Gid::from_raw(0);
+    let root_uid = unistd::Uid::from_raw(0);
+    unistd::setgroups(&[root_gid])?;
+    unistd::setgid(root_gid)?;
+    unistd::setuid(root_uid)?;
 
     // mount pivot_root
     Mount::builder()

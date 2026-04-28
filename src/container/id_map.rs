@@ -1,3 +1,4 @@
+use nix::unistd::{self, Pid};
 use std::{env, error::Error, fs};
 
 #[allow(dead_code)]
@@ -7,7 +8,7 @@ pub struct SysProcIdMap {
     pub size: u32,
 }
 
-pub fn apply(pid: i32) -> Result<(), Box<dyn Error>> {
+pub fn apply(pid: Pid) -> Result<(), Box<dyn Error>> {
     let (uid_mappings, gid_mappings) = mappings()?;
 
     let uid_map = uid_mappings
@@ -30,9 +31,13 @@ fn mappings() -> Result<(Vec<SysProcIdMap>, Vec<SysProcIdMap>), Box<dyn Error>> 
     let host_uid = host_uid()?;
     let host_gid = host_gid()?;
 
-    let user = env::var("SUDO_USER")
-        .or_else(|_| env::var("USER"))
-        .map_err(|_| "SUDO_USER or USER is required for subuid/subgid lookup")?;
+    let user = match env::var("SUDO_USER") {
+        Ok(sudo_user) => sudo_user,
+        Err(_) => match env::var("USER") {
+            Ok(user) => user,
+            Err(_) => return Err("SUDO_USER or USER is required for subuid/subgid lookup".into()),
+        },
+    };
 
     let (sub_uid_start, sub_uid_size) = sub_id_range("/etc/subuid", &user)?;
     let (sub_gid_start, sub_gid_size) = sub_id_range("/etc/subgid", &user)?;
@@ -46,24 +51,24 @@ fn mappings() -> Result<(Vec<SysProcIdMap>, Vec<SysProcIdMap>), Box<dyn Error>> 
     let uid_mappings = vec![
         SysProcIdMap {
             container_id: 0,
-            host_id: host_uid,
+            host_id: host_uid.into(),
             size: 1,
         },
         SysProcIdMap {
             container_id: 1,
-            host_id: sub_uid_start,
+            host_id: sub_uid_start.into(),
             size: uid_size,
         },
     ];
     let gid_mappings = vec![
         SysProcIdMap {
             container_id: 0,
-            host_id: host_gid,
+            host_id: host_gid.into(),
             size: 1,
         },
         SysProcIdMap {
             container_id: 1,
-            host_id: sub_gid_start,
+            host_id: sub_gid_start.into(),
             size: gid_size,
         },
     ];
@@ -71,25 +76,27 @@ fn mappings() -> Result<(Vec<SysProcIdMap>, Vec<SysProcIdMap>), Box<dyn Error>> 
     Ok((uid_mappings, gid_mappings))
 }
 
-fn host_uid() -> Result<u32, String> {
-    let mut host_uid = unsafe { libc::getuid() };
+fn host_uid() -> Result<unistd::Uid, String> {
+    let mut host_uid = unistd::getuid();
 
     if let Ok(sudo_uid) = env::var("SUDO_UID") {
-        host_uid = sudo_uid
-            .parse()
-            .map_err(|err| format!("parse SUDO_UID: {err}"))?;
+        host_uid = match sudo_uid.parse() {
+            Ok(uid) => unistd::Uid::from_raw(uid),
+            Err(err) => return Err(format!("parse SUDO_UID: {err}").into()),
+        };
     }
 
     Ok(host_uid)
 }
 
-fn host_gid() -> Result<u32, String> {
-    let mut host_gid = unsafe { libc::getgid() };
+fn host_gid() -> Result<unistd::Gid, String> {
+    let mut host_gid = unistd::getgid();
 
     if let Ok(sudo_gid) = env::var("SUDO_GID") {
-        host_gid = sudo_gid
-            .parse()
-            .map_err(|err| format!("parse SUDO_GID: {err}"))?;
+        host_gid = match sudo_gid.parse() {
+            Ok(gid) => unistd::Gid::from_raw(gid),
+            Err(err) => return Err(format!("parse SUDO_GID: {err}").into()),
+        };
     }
 
     Ok(host_gid)
@@ -109,15 +116,16 @@ fn sub_id_range(path: &str, name: &str) -> Result<(u32, u32), Box<dyn Error>> {
             continue;
         }
 
-        let start = fields[1]
-            .parse()
-            .map_err(|err| format!("parse {path} start for {name:?}: {err}"))?;
-
-        let size = fields[2]
-            .parse()
-            .map_err(|err| format!("parse {path} size for {name:?}: {err}"))?;
-
-        return Ok((start, size));
+        return Ok((
+            match fields[1].parse() {
+                Ok(start) => start,
+                Err(err) => return Err(format!("parse {path} start for {name:?}: {err}").into()),
+            },
+            match fields[2].parse() {
+                Ok(size) => size,
+                Err(err) => return Err(format!("parse {path} size for {name:?}: {err}").into()),
+            },
+        ));
     }
 
     Err(format!("{path} has no entry for {name:?}").into())

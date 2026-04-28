@@ -4,9 +4,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use nix::unistd::Pid;
+
 pub fn setup(
     id: &str,
-    pid: libc::pid_t,
+    pid: Pid,
     cpu_quota: &str,
     cpu_period: &str,
     mem_limit: &str,

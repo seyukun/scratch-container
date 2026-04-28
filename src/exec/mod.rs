@@ -54,7 +54,7 @@ pub fn run<'a>(mut args: impl Iterator<Item = &'a String>) -> Result<ExitCode, B
 
     let mut stack = vec![0_u8; CHILD_STACK_SIZE];
     let pid = clone::isolate(
-        exec_command,
+        child,
         &mut stack,
         ExecConfig {
             root,
@@ -70,14 +70,13 @@ pub fn run<'a>(mut args: impl Iterator<Item = &'a String>) -> Result<ExitCode, B
     }
 }
 
-fn exec_command(config: ExecConfig) -> Result<(), Box<dyn Error>> {
+fn child(config: ExecConfig) -> Result<(), Box<dyn Error>> {
     unistd::fchdir(&config.root)?;
     unistd::chroot(".")?;
     unistd::chdir("/")?;
 
     let root_gid = unistd::Gid::from_raw(0);
     let root_uid = unistd::Uid::from_raw(0);
-
     unistd::setgroups(&[root_gid])?;
     unistd::setgid(root_gid)?;
     unistd::setuid(root_uid)?;
