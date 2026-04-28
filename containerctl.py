@@ -143,10 +143,8 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     path = write_unit(args)
     run_checked(["systemctl", "daemon-reload"])
-    if args.enable:
-        run_checked(["systemctl", "enable", unit_name(args.id)])
-    if not args.no_start:
-        run_checked(["systemctl", "start", unit_name(args.id)])
+    run_checked(["systemctl", "enable", unit_name(args.id)])
+    run_checked(["systemctl", "start", unit_name(args.id)])
     print(path)
 
 
@@ -163,12 +161,14 @@ def cmd_exec(args: argparse.Namespace) -> None:
 
 def cmd_start(args: argparse.Namespace) -> None:
     require_root()
+    run_checked(["systemctl", "enable", unit_name(args.id)])
     run_checked(["systemctl", "start", unit_name(args.id)])
 
 
 def cmd_stop(args: argparse.Namespace) -> None:
     require_root()
     run_checked(["systemctl", "stop", unit_name(args.id)])
+    run_checked(["systemctl", "disable", unit_name(args.id)])
 
 
 def cmd_status(args: argparse.Namespace) -> None:
@@ -205,10 +205,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_p = sub.add_parser("run", help="create a systemd unit and start a container")
     add_common_binary(run_p)
-    run_p.add_argument("--enable", action="store_true", help="enable unit at boot")
-    run_p.add_argument(
-        "--no-start", action="store_true", help="write the unit without starting it"
-    )
     run_p.add_argument("rootfs")
     run_p.add_argument("id")
     run_p.add_argument("hostname")
