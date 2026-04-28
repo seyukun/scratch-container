@@ -38,7 +38,13 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
 
-            not_implemented("exec")
+            match exec::run(args.iter()) {
+                Ok(exit_code) => exit_code,
+                Err(err) => {
+                    eprintln!("{}", err);
+                    ExitCode::FAILURE
+                }
+            }
         }
         "-h" | "--help" | "help" => {
             print_usage(&program);
@@ -56,9 +62,4 @@ fn print_usage(program: &str) {
     eprintln!("Usage:");
     eprintln!("  {program} {RUN_USAGE}");
     eprintln!("  {program} {EXEC_USAGE}");
-}
-
-fn not_implemented(command: &str) -> ExitCode {
-    eprintln!("{command}: not implemented yet");
-    ExitCode::FAILURE
 }
